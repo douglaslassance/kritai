@@ -11,7 +11,6 @@ from PyQt5.QtCore import QByteArray
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtCore import QSize
 from PyQt5.QtGui import QIcon, QImage, QPixmap
-from PyQt5.QtWidgets import QStyle
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -65,16 +64,21 @@ DEBOUNCE_MS = 2000
 
 
 class PreviewLabel(QLabel):
-    """QLabel that maintains the aspect ratio of the active document."""
+    """QLabel that paints its pixmap centered with correct aspect ratio."""
 
     def __init__(self):
         super().__init__()
         self._ratio = 1.0
+        self._source = None
 
     def setRatio(self, ratio):
         if ratio > 0 and ratio != self._ratio:
             self._ratio = ratio
             self.updateGeometry()
+
+    def setPixmap(self, pixmap):
+        self._source = pixmap
+        self.update()
 
     def hasHeightForWidth(self):
         return True
@@ -87,6 +91,15 @@ class PreviewLabel(QLabel):
 
     def minimumSizeHint(self):
         return QSize(1, 1)
+
+    def paintEvent(self, event):
+        from PyQt5.QtGui import QPainter
+        painter = QPainter(self)
+        if self._source:
+            scaled = self._source.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            x = (self.width() - scaled.width()) // 2
+            y = (self.height() - scaled.height()) // 2
+            painter.drawPixmap(x, y, scaled)
 
 
 class CollapsibleSection(QWidget):
@@ -233,8 +246,7 @@ class KritaiDocker(DockWidget):
         self._preview = PreviewLabel()
         self._preview.setAlignment(Qt.AlignCenter)
         self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._preview.setScaledContents(True)
-        self._preview.setStyleSheet("background: #1a1a1a; border-radius: 4px;")
+        self._preview.setStyleSheet("border-radius: 4px;")
         self._preview.setVisible(False)
         outer.addWidget(self._preview)
 
@@ -372,7 +384,7 @@ class KritaiDocker(DockWidget):
             "1.0 = output stays very close to the canvas.\n"
             "0.5–0.7 is a good starting range."
         )
-        form.addRow("Input Strength", strength_row)
+        form.addRow("Strength", strength_row)
 
         self._max_px = QSpinBox()
         self._max_px.setRange(64, 4096)
@@ -383,7 +395,7 @@ class KritaiDocker(DockWidget):
             "Longest edge of the image sent to mflux. "
             "Lower = faster, less VRAM. Output will match this resolution."
         )
-        form.addRow("Input Max Resolution", self._max_px)
+        form.addRow("Resolution", self._max_px)
 
         seed_row = QWidget()
         seed_layout = QHBoxLayout(seed_row)
@@ -411,7 +423,7 @@ class KritaiDocker(DockWidget):
         self._auto_btn = QToolButton()
         self._auto_btn.setCheckable(True)
         self._auto_btn.setToolTip("Live refresh — regenerate automatically whenever the canvas or a setting changes")
-        self._auto_btn.setIcon(QIcon.fromTheme("media-playlist-repeat", self.style().standardIcon(QStyle.SP_BrowserReload)))
+        self._auto_btn.setIcon(Krita.instance().icon("reload-preset"))
         self._auto_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._auto_btn.toggled.connect(self._on_auto_toggled)
 
@@ -421,10 +433,18 @@ class KritaiDocker(DockWidget):
         btn_row.addWidget(self._generate_btn)
         btn_row.addWidget(self._auto_btn)
 
+        self._use_btn = QToolButton()
+        self._use_btn.setToolTip("Add result as a new layer in the document")
+        self._use_btn.setIcon(Krita.instance().icon("addlayer"))
+        self._use_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._use_btn.setEnabled(False)
+        self._use_btn.clicked.connect(self._import_to_layer)
+        btn_row.addWidget(self._use_btn)
+
         self._log_btn = QToolButton()
         self._log_btn.setCheckable(True)
         self._log_btn.setToolTip("Show generation logs")
-        self._log_btn.setIcon(QIcon.fromTheme("utilities-terminal", self.style().standardIcon(QStyle.SP_FileDialogDetailedView)))
+        self._log_btn.setIcon(Krita.instance().icon("view-list-text"))
         self._log_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._log_btn.toggled.connect(self._on_log_toggled)
         btn_row.addWidget(self._log_btn)
@@ -718,12 +738,38 @@ class KritaiDocker(DockWidget):
             return
         self._preview.setPixmap(pixmap)
         self._preview.setVisible(True)
+        self._use_btn.setEnabled(True)
+
+    def _import_to_layer(self):
+        if not self._tmp_output or not os.path.exists(self._tmp_output):
+            return
+        doc = self._current_doc
+        if not doc:
+            return
+
+        # Load the result and scale it to the document dimensions.
+        img = QImage(self._tmp_output).convertToFormat(QImage.Format_ARGB32)
+        if img.isNull():
+            return
+        if img.width() != doc.width() or img.height() != doc.height():
+            img = img.scaled(doc.width(), doc.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+        layer = doc.createNode("Kritai Result", "paintlayer")
+        doc.rootNode().addChildNode(layer, None)
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())
+        layer.setPixelData(bytes(ptr), 0, 0, img.width(), img.height())
+        doc.refreshProjection()
+
+        # Stop auto mode now that the result is committed to the document.
+        self._auto_btn.setChecked(False)
 
     # ------------------------------------------------------------------
 
     def _update_preview_ratio(self, doc):
         if doc and doc.width() > 0:
             self._preview.setRatio(doc.height() / doc.width())
+
 
     def canvasChanged(self, canvas):
         # Save outgoing document's settings before switching.
