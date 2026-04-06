@@ -5,11 +5,20 @@ A Krita docker that sends your canvas through a local [mflux](https://github.com
 ## Requirements
 
 - **Krita 5.x** with Python plugin support enabled
-- **mflux** installed locally:
+- **uv** — install via Homebrew:
   ```bash
-  pip install mflux
+  brew install uv
   ```
-  The plugin expects `mflux-generate` at `~/.local/bin/mflux-generate` (the default pip install location on macOS/Linux).
+- **mflux** — install via uv:
+  ```bash
+  uv tool install mflux
+  ```
+  The plugin expects mflux binaries at `~/.local/bin/` (the default uv tool install location).
+- **Hugging Face CLI** — required to download gated models (e.g. FLUX.1-Kontext-dev). Install via Homebrew and log in:
+  ```bash
+  brew install huggingface-cli
+  hf auth login
+  ```
 
 ## Installation
 
