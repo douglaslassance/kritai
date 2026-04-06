@@ -215,6 +215,11 @@ class KritaiDocker(DockWidget):
         self._tmp_output = None
         self._last_canvas_hash = None
         self._current_doc = None
+        self._doc_previews = {}   # uid → QPixmap, session only
+        self._doc_settings = {}   # uid → settings dict, session only
+
+        # Flush settings to annotation only when Krita saves the file.
+        Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
 
         # Polling timer: checks canvas content periodically when auto is on.
         self._poll_timer = QTimer()
@@ -496,7 +501,7 @@ class KritaiDocker(DockWidget):
         doc = self._current_doc
         if not doc:
             return
-        data = {
+        self._doc_settings[doc.fileName() or str(id(doc))] = {
             "prompt": self._prompt.toPlainText(),
             "negative_prompt": self._negative_prompt.text(),
             "model": self._model.currentText(),
@@ -508,17 +513,31 @@ class KritaiDocker(DockWidget):
             "seed": self._seed.value(),
             "random_seed": self._random_seed.isChecked(),
         }
-        raw = json.dumps(data).encode("utf-8")
-        doc.setAnnotation(self.ANNOTATION_TYPE, "Kritai settings", QByteArray(raw))
+
+    def _on_image_saved(self, filename):
+        """Flush in-memory settings to the document annotation on save."""
+        for doc in Krita.instance().documents():
+            if doc.fileName() == filename:
+                data = self._doc_settings.get(doc.fileName() or str(id(doc)))
+                if data:
+                    raw = json.dumps(data).encode("utf-8")
+                    doc.setAnnotation(self.ANNOTATION_TYPE, "Kritai settings", QByteArray(raw))
+                break
 
     def _load_settings(self, doc):
-        raw = doc.annotation(self.ANNOTATION_TYPE)
-        if not raw:
-            return
-        try:
-            data = json.loads(bytes(raw).decode("utf-8"))
-        except Exception:
-            return
+        uid = doc.fileName() or str(id(doc))
+        if uid in self._doc_settings:
+            data = self._doc_settings[uid]
+        else:
+            # First time seeing this doc this session — load from saved annotation.
+            raw = doc.annotation(self.ANNOTATION_TYPE)
+            if not raw:
+                return
+            try:
+                data = json.loads(bytes(raw).decode("utf-8"))
+            except Exception:
+                return
+            self._doc_settings[uid] = data
 
         # Block signals while restoring to avoid triggering _save_settings
         # for each individual widget change.
@@ -739,16 +758,19 @@ class KritaiDocker(DockWidget):
         self._preview.setPixmap(pixmap)
         self._preview.setVisible(True)
         self._use_btn.setEnabled(True)
+        if self._current_doc:
+            self._doc_previews[self._current_doc.fileName() or str(id(self._current_doc))] = pixmap
 
     def _import_to_layer(self):
-        if not self._tmp_output or not os.path.exists(self._tmp_output):
-            return
         doc = self._current_doc
         if not doc:
             return
+        pixmap = self._doc_previews.get(doc.fileName() or str(id(doc)))
+        if not pixmap:
+            return
 
-        # Load the result and scale it to the document dimensions.
-        img = QImage(self._tmp_output).convertToFormat(QImage.Format_ARGB32)
+        # Convert the cached pixmap and scale it to the document dimensions.
+        img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
         if img.isNull():
             return
         if img.width() != doc.width() or img.height() != doc.height():
@@ -772,9 +794,6 @@ class KritaiDocker(DockWidget):
 
 
     def canvasChanged(self, canvas):
-        # Save outgoing document's settings before switching.
-        self._save_settings()
-
         # Disable auto mode when switching documents.
         self._auto_btn.setChecked(False)
 
@@ -783,3 +802,14 @@ class KritaiDocker(DockWidget):
         if self._current_doc:
             self._update_preview_ratio(self._current_doc)
             self._load_settings(self._current_doc)
+            cached = self._doc_previews.get(self._current_doc.fileName() or str(id(self._current_doc)))
+            if cached:
+                self._preview.setPixmap(cached)
+                self._preview.setVisible(True)
+                self._use_btn.setEnabled(True)
+            else:
+                self._preview.setVisible(False)
+                self._use_btn.setEnabled(False)
+        else:
+            self._preview.setVisible(False)
+            self._use_btn.setEnabled(False)
