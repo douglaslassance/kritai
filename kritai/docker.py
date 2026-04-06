@@ -9,11 +9,13 @@ import threading
 from krita import DockWidget, InfoObject
 from PyQt5.QtCore import QByteArray
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtCore import QSize
+from PyQt5.QtCore import QEvent, QObject, QSize
 from PyQt5.QtGui import QIcon, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
@@ -23,8 +25,8 @@ from PyQt5.QtWidgets import (
     QProgressBar,
     QPushButton,
     QSlider,
+    QSpacerItem,
     QToolButton,
-    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QVBoxLayout,
@@ -33,28 +35,34 @@ from PyQt5.QtWidgets import (
 
 MFLUX_DIR = os.path.expanduser("~/.local/bin")
 
-# Maps model name → (cli_binary, model_flag_or_None, supports_strength, supports_guidance)
+# Maps model name → (cli_binary, model_flag_or_None, supports_strength, supports_guidance, needs_reference_image)
 # Distilled models (klein, turbo, schnell) don't accept a variable guidance scale.
 # Each model family has its own CLI; FLUX.2 and FIBO share a CLI across variants.
+# Models with needs_reference_image=True use --image-paths [canvas, ref] instead of --image-path canvas.
 MODEL_CLI = {
     # FLUX.2 — distilled variants: no guidance; base variants: guidance ok
-    "flux2-klein-4b":      ("mflux-generate-flux2",      "flux2-klein-4b",      True,  False),
-    "flux2-klein-9b":      ("mflux-generate-flux2",      "flux2-klein-9b",      True,  False),
-    "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True),
-    "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True),
+    "flux2-klein-4b":      ("mflux-generate-flux2",      "flux2-klein-4b",      True,  False, False),
+    "flux2-klein-9b":      ("mflux-generate-flux2",      "flux2-klein-9b",      True,  False, False),
+    "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True,  False),
+    "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
+    # FLUX.2 edit — canvas + optional reference image via --image-paths
+    "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, True,  True),
     # Z-Image
-    "z-image-turbo":       ("mflux-generate-z-image-turbo", None,               True,  False),
-    "z-image":             ("mflux-generate-z-image",     None,                 True,  True),
+    "z-image-turbo":       ("mflux-generate-z-image-turbo", None,               True,  False, False),
+    "z-image":             ("mflux-generate-z-image",     None,                 True,  True,  False),
     # FIBO
-    "fibo":                ("mflux-generate-fibo",        "fibo",               True,  True),
-    "fibo-lite":           ("mflux-generate-fibo",        "fibo-lite",          True,  True),
-    "fibo-edit":           ("mflux-generate-fibo-edit",   "fibo-edit",          False, True),
-    "fibo-edit-rmbg":      ("mflux-generate-fibo-edit",   "fibo-edit-rmbg",     False, True),
+    "fibo":                ("mflux-generate-fibo",        "fibo",               True,  True,  False),
+    "fibo-lite":           ("mflux-generate-fibo",        "fibo-lite",          True,  True,  False),
     # Qwen
-    "qwen":                ("mflux-generate-qwen",        None,                 True,  True),
+    "qwen":                ("mflux-generate-qwen",        None,                 True,  True,  False),
+    # Qwen edit — canvas + optional reference image via --image-paths
+    "qwen-edit":           ("mflux-generate-qwen-edit",   None,                 False, True,  True),
+    # Kontext (image editing via instruction)
+    "kontext-dev":         ("mflux-generate-kontext",     "dev",                True,  True,  False),
+    "kontext-schnell":     ("mflux-generate-kontext",     "schnell",            True,  False, False),
     # FLUX.1 (legacy)
-    "dev":                 ("mflux-generate",             "dev",                True,  True),
-    "schnell":             ("mflux-generate",             "schnell",            True,  False),
+    "dev":                 ("mflux-generate",             "dev",                True,  True,  False),
+    "schnell":             ("mflux-generate",             "schnell",            True,  False, False),
 }
 
 # How often (ms) to poll canvas for changes when auto-mode is on.
@@ -205,6 +213,20 @@ class GenerateThread(QThread):
             self.errored.emit(str(e))
 
 
+class _FocusOutSignal(QObject):
+    """Emits focusLost when the watched widget loses focus."""
+    focusLost = pyqtSignal()
+
+    def __init__(self, widget):
+        super().__init__(widget)
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.FocusOut:
+            self.focusLost.emit()
+        return False
+
+
 class KritaiDocker(DockWidget):
 
     def __init__(self):
@@ -265,44 +287,35 @@ class KritaiDocker(DockWidget):
         self._progress.setVisible(False)
         outer.addWidget(self._progress)
 
-        # --- Prompt ---
-        self._prompt = QPlainTextEdit()
-        self._prompt.setPlaceholderText("Prompt…")
-        self._prompt.setToolTip("Describe what you want the image to look like.")
-        self._prompt.setFixedHeight(60)
-        outer.addWidget(self._prompt)
-
-        # --- Negative prompt ---
-        self._negative_prompt = QLineEdit()
-        self._negative_prompt.setPlaceholderText("Negative prompt (optional)")
-        self._negative_prompt.setToolTip(
-            "Describe what you want to avoid in the result.\n"
-            "Example: blurry, low quality, extra limbs."
-        )
-        outer.addWidget(self._negative_prompt)
-
-        # --- Scrollable settings ---
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(scroll.NoFrame)
-        scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        settings_widget = QWidget()
-        form = QFormLayout(settings_widget)
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(4)
-        scroll.setWidget(settings_widget)
-        outer.addWidget(scroll)
-
+        # --- Model selector ---
         self._model = QComboBox()
         # Groups mirror the model families in the mflux README.
         # SeedVR2 (upscaling) and Depth Pro (depth estimation) are omitted
         # as they are not image-to-image generation models.
+        model_tooltips = {
+            "flux2-klein-4b":      "Fast distilled 4B model. Good default for quick iterations. No guidance.",
+            "flux2-klein-9b":      "Distilled 9B model. Higher quality than 4B but slower. No guidance.",
+            "flux2-klein-base-4b": "Non-distilled 4B base model. Supports guidance. Needs more steps.",
+            "flux2-klein-base-9b": "Non-distilled 9B base model. Best quality in the FLUX.2 family.",
+            "flux2-edit":          "Edit the canvas with a prompt and an optional reference image.",
+            "z-image-turbo":       "Fast distilled variant. No guidance.",
+            "z-image":             "Full model. Supports guidance.",
+            "fibo":                "Generation model with strong style capabilities.",
+            "fibo-lite":           "Lighter and faster variant.",
+            "qwen":                "Qwen-based generation. Supports guidance.",
+            "qwen-edit":           "Instruction-based canvas editing with an optional reference image.",
+            "kontext-dev":         "High-quality instruction-based image editing.",
+            "kontext-schnell":     "Faster distilled variant. No guidance.",
+            "dev":                 "Original full-quality model. Supports guidance.",
+            "schnell":             "Fast distilled variant. No guidance.",
+        }
         model_groups = {
             "FLUX.2 (recommended)": [
                 "flux2-klein-4b",
                 "flux2-klein-9b",
                 "flux2-klein-base-4b",
                 "flux2-klein-base-9b",
+                "flux2-edit",
             ],
             "Z-Image": [
                 "z-image-turbo",
@@ -311,11 +324,14 @@ class KritaiDocker(DockWidget):
             "FIBO": [
                 "fibo",
                 "fibo-lite",
-                "fibo-edit",
-                "fibo-edit-rmbg",
             ],
             "Qwen": [
                 "qwen",
+                "qwen-edit",
+            ],
+            "Kontext": [
+                "kontext-dev",
+                "kontext-schnell",
             ],
             "FLUX.1 (legacy)": [
                 "dev",
@@ -329,13 +345,40 @@ class KritaiDocker(DockWidget):
             self._model.model().item(self._model.count() - 1).setEnabled(False)
             for m in models:
                 self._model.addItem(m)
+                idx = self._model.count() - 1
+                self._model.setItemData(idx, model_tooltips.get(m, ""), Qt.ToolTipRole)
         self._model.setCurrentIndex(self._model.findText("dev"))
         self._model.setToolTip(
             "Which mflux model family to use for generation.\n"
             "FLUX.2 and Z-Image are the fastest and highest quality.\n"
             "FLUX.1 (dev/schnell) are older but widely supported."
         )
-        form.addRow("Model", self._model)
+        self._model.currentIndexChanged.connect(self._update_model_ui)
+        outer.addWidget(self._model)
+
+        # --- Prompt ---
+        self._prompt = QPlainTextEdit()
+        self._prompt.setPlaceholderText("Prompt…")
+        self._prompt.setToolTip("Describe what you want the image to look like.")
+        self._prompt.setFixedHeight(60)
+        outer.addWidget(self._prompt)
+
+        # --- Negative prompt ---
+        self._negative_prompt = QLineEdit()
+        self._negative_prompt.setPlaceholderText("Optional negative prompt…")
+        self._negative_prompt.setToolTip(
+            "Describe what you want to avoid in the result.\n"
+            "Example: blurry, low quality, extra limbs."
+        )
+        outer.addWidget(self._negative_prompt)
+
+        # --- Settings ---
+        settings_widget = QWidget()
+        form = QFormLayout(settings_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+        outer.addWidget(settings_widget)
+
 
         self._quantize = QSpinBox()
         self._quantize.setSpecialValueText("None")
@@ -368,6 +411,7 @@ class KritaiDocker(DockWidget):
             "Not supported by distilled models (they ignore this setting)."
         )
         form.addRow("Guidance", self._guidance)
+        self._guidance_label = form.labelForField(self._guidance)
 
         strength_row = QWidget()
         strength_layout = QHBoxLayout(strength_row)
@@ -375,7 +419,7 @@ class KritaiDocker(DockWidget):
         strength_layout.setSpacing(6)
         self._strength = QSlider(Qt.Horizontal)
         self._strength.setRange(0, 100)
-        self._strength.setValue(60)
+        self._strength.setValue(75)
         self._strength_label = QLabel("0.60")
         self._strength_label.setFixedWidth(30)
         self._strength.valueChanged.connect(
@@ -390,17 +434,39 @@ class KritaiDocker(DockWidget):
             "0.5–0.7 is a good starting range."
         )
         form.addRow("Strength", strength_row)
+        self._strength_row = strength_row
+        self._strength_label_form = form.labelForField(strength_row)
 
-        self._max_px = QSpinBox()
-        self._max_px.setRange(64, 4096)
-        self._max_px.setSingleStep(64)
-        self._max_px.setValue(512)
-        self._max_px.setSuffix("")
-        self._max_px.setToolTip(
-            "Longest edge of the image sent to mflux. "
-            "Lower = faster, less VRAM. Output will match this resolution."
+        ref_row = QWidget()
+        ref_layout = QHBoxLayout(ref_row)
+        ref_layout.setContentsMargins(0, 0, 0, 0)
+        ref_layout.setSpacing(4)
+        self._ref_image = QLineEdit()
+        self._ref_image.setPlaceholderText("Optional reference image…")
+        self._ref_image.setToolTip(
+            "Optional second image passed alongside the canvas to the model.\n"
+            "Leave empty to use the canvas alone."
         )
-        form.addRow("Resolution", self._max_px)
+        ref_browse = QPushButton("…")
+        ref_browse.setFixedWidth(28)
+        ref_browse.clicked.connect(self._browse_reference_image)
+        ref_layout.addWidget(self._ref_image)
+        ref_layout.addWidget(ref_browse)
+        form.addRow("Reference", ref_row)
+        self._ref_row = ref_row
+        self._ref_label = form.labelForField(ref_row)
+
+        self._resolution_scale = QDoubleSpinBox()
+        self._resolution_scale.setRange(0.1, 4.0)
+        self._resolution_scale.setSingleStep(0.25)
+        self._resolution_scale.setValue(0.5)
+        self._resolution_scale.setSuffix("")
+        self._resolution_scale.setToolTip(
+            "Scale of the canvas sent to mflux relative to its original size.\n"
+            "0.5× = half resolution (faster, less VRAM).\n"
+            "1.0× = full resolution."
+        )
+        form.addRow("Scale", self._resolution_scale)
 
         seed_row = QWidget()
         seed_layout = QHBoxLayout(seed_row)
@@ -438,6 +504,13 @@ class KritaiDocker(DockWidget):
         btn_row.addWidget(self._generate_btn)
         btn_row.addWidget(self._auto_btn)
 
+        self._upscale_btn = QPushButton()
+        self._upscale_btn.setIcon(Krita.instance().icon("zoom-in"))
+        self._upscale_btn.setToolTip("Upscale preview using SeedVR2")
+        self._upscale_btn.setEnabled(False)
+        self._upscale_btn.clicked.connect(self._upscale)
+        btn_row.addWidget(self._upscale_btn)
+
         self._use_btn = QToolButton()
         self._use_btn.setToolTip("Add result as a new layer in the document")
         self._use_btn.setIcon(Krita.instance().icon("addlayer"))
@@ -469,7 +542,9 @@ class KritaiDocker(DockWidget):
 
         outer.addWidget(self._log)
         outer.addWidget(self._clear_btn)
-        outer.addStretch()
+        outer.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding))
+
+        self._update_model_ui()
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -478,19 +553,40 @@ class KritaiDocker(DockWidget):
     ANNOTATION_TYPE = "kritai_settings"
 
     def _connect_settings_signals(self):
+        # All changes persist settings immediately.
         for signal in [
-            self._prompt.textChanged,  # QPlainTextEdit signal (no args)
+            self._prompt.textChanged,
             self._negative_prompt.textChanged,
+            self._ref_image.textChanged,
             self._model.currentIndexChanged,
             self._quantize.valueChanged,
             self._steps.valueChanged,
             self._guidance.valueChanged,
             self._strength.valueChanged,
-            self._max_px.valueChanged,
+            self._resolution_scale.valueChanged,
             self._seed.valueChanged,
             self._random_seed.toggled,
         ]:
             signal.connect(self._save_settings)
+
+        # Auto-refresh triggers only on focus-out for text fields,
+        # immediately for all other controls.
+        self._negative_prompt.editingFinished.connect(self._on_setting_changed)
+        self._ref_image.editingFinished.connect(self._on_setting_changed)
+
+        prompt_filter = _FocusOutSignal(self._prompt)
+        prompt_filter.focusLost.connect(self._on_setting_changed)
+
+        for signal in [
+            self._model.currentIndexChanged,
+            self._quantize.valueChanged,
+            self._steps.valueChanged,
+            self._guidance.valueChanged,
+            self._strength.valueChanged,
+            self._resolution_scale.valueChanged,
+            self._seed.valueChanged,
+            self._random_seed.toggled,
+        ]:
             signal.connect(self._on_setting_changed)
 
     def _on_setting_changed(self):
@@ -504,12 +600,13 @@ class KritaiDocker(DockWidget):
         self._doc_settings[doc.fileName() or str(id(doc))] = {
             "prompt": self._prompt.toPlainText(),
             "negative_prompt": self._negative_prompt.text(),
+            "reference_image": self._ref_image.text(),
             "model": self._model.currentText(),
             "quantize": self._quantize.value(),
             "steps": self._steps.value(),
             "guidance": self._guidance.value(),
             "strength": self._strength.value() / 100,
-            "max_px": self._max_px.value(),
+            "resolution_scale": self._resolution_scale.value(),
             "seed": self._seed.value(),
             "random_seed": self._random_seed.isChecked(),
         }
@@ -542,15 +639,16 @@ class KritaiDocker(DockWidget):
         # Block signals while restoring to avoid triggering _save_settings
         # for each individual widget change.
         widgets = [
-            self._prompt, self._negative_prompt, self._model,
+            self._prompt, self._negative_prompt, self._ref_image, self._model,
             self._quantize, self._steps, self._guidance,
-            self._strength, self._max_px, self._seed, self._random_seed,
+            self._strength, self._resolution_scale, self._seed, self._random_seed,
         ]
         for w in widgets:
             w.blockSignals(True)
 
         self._prompt.setPlainText(data.get("prompt", ""))
         self._negative_prompt.setText(data.get("negative_prompt", ""))
+        self._ref_image.setText(data.get("reference_image", ""))
         model = data.get("model", "dev")
         idx = self._model.findText(model)
         if idx >= 0:
@@ -558,14 +656,16 @@ class KritaiDocker(DockWidget):
         self._quantize.setValue(data.get("quantize", 4))
         self._steps.setValue(data.get("steps", 20))
         self._guidance.setValue(data.get("guidance", 3.5))
-        self._strength.setValue(int(data.get("strength", 0.6) * 100))
-        self._max_px.setValue(data.get("max_px", 512))
+        self._strength.setValue(int(data.get("strength", 0.75) * 100))
+        self._resolution_scale.setValue(data.get("resolution_scale", 0.5))
         self._seed.setValue(data.get("seed", 0))
         self._random_seed.setChecked(data.get("random_seed", False))
         self._seed.setDisabled(self._random_seed.isChecked())
 
         for w in widgets:
             w.blockSignals(False)
+
+        self._update_model_ui()
 
     # ------------------------------------------------------------------
     # Auto-mode
@@ -580,19 +680,20 @@ class KritaiDocker(DockWidget):
             self._debounce_timer.stop()
 
     def _export_scaled(self, doc, path):
-        """Export the canvas to path, scaling so the longest edge <= max_px."""
-        max_px = self._max_px.value()
+        """Export the canvas to path, scaled by the resolution scale factor."""
+        scale = self._resolution_scale.value()
         doc.setBatchmode(True)
         doc.exportImage(path, InfoObject())
         doc.setBatchmode(False)
 
+        if abs(scale - 1.0) < 0.001:
+            return
         img = QImage(path)
         if img.isNull():
             return
-        w, h = img.width(), img.height()
-        if max(w, h) > max_px:
-            scaled = img.scaled(max_px, max_px, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-            scaled.save(path, "PNG")
+        new_w = max(1, int(img.width() * scale))
+        new_h = max(1, int(img.height() * scale))
+        img.scaled(new_w, new_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(path, "PNG")
 
     def _canvas_hash(self):
         """Return a hash of a small in-memory thumbnail — no disk I/O."""
@@ -627,7 +728,6 @@ class KritaiDocker(DockWidget):
         self._progress.setFormat(text)
 
     def _set_busy(self, busy):
-        self._generate_btn.setEnabled(not busy)
         self._progress.setValue(0)
         self._progress.setVisible(busy)
         self._set_status("Generating…" if busy else "")
@@ -647,7 +747,8 @@ class KritaiDocker(DockWidget):
             return
 
         if self._thread and self._thread.isRunning():
-            return
+            self._thread.terminate()
+            self._thread.wait()
 
         # Clean up previous temp files
         for path in (self._tmp_input, self._tmp_output):
@@ -669,9 +770,10 @@ class KritaiDocker(DockWidget):
         self._export_scaled(doc, self._tmp_input)
 
         model_name = self._model.currentText()
-        cli_name, model_flag, supports_strength, supports_guidance = MODEL_CLI.get(
-            model_name, ("mflux-generate", model_name, True, True)
+        cli_name, model_flag, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
+            model_name, ("mflux-generate", model_name, True, True, False)
         )
+        needs_reference = rest[0] if rest else False
         cli_path = os.path.join(MFLUX_DIR, cli_name)
 
         cmd = [cli_path, "--prompt", prompt]
@@ -679,8 +781,15 @@ class KritaiDocker(DockWidget):
         if model_flag:
             cmd += ["--model", model_flag]
 
+        if needs_reference:
+            cmd += ["--image-paths", self._tmp_input]
+            ref_path = self._ref_image.text().strip()
+            if ref_path:
+                cmd.append(ref_path)
+        else:
+            cmd += ["--image-path", self._tmp_input]
+
         cmd += [
-            "--image-path", self._tmp_input,
             "--steps", str(self._steps.value()),
             "--output", self._tmp_output,
         ]
@@ -758,6 +867,7 @@ class KritaiDocker(DockWidget):
         self._preview.setPixmap(pixmap)
         self._preview.setVisible(True)
         self._use_btn.setEnabled(True)
+        self._upscale_btn.setEnabled(True)
         if self._current_doc:
             self._doc_previews[self._current_doc.fileName() or str(id(self._current_doc))] = pixmap
 
@@ -786,7 +896,139 @@ class KritaiDocker(DockWidget):
         # Stop auto mode now that the result is committed to the document.
         self._auto_btn.setChecked(False)
 
+    def _upscale(self):
+        if not self._tmp_output or not os.path.exists(self._tmp_output):
+            self._set_status("No preview to upscale.")
+            return
+        if self._thread and self._thread.isRunning():
+            return
+
+        # --- Modal options dialog ---
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Upscale Options")
+        layout = QVBoxLayout(dlg)
+        form = QFormLayout()
+        layout.addLayout(form)
+
+        resolution = QDoubleSpinBox()
+        resolution.setRange(1.0, 8.0)
+        resolution.setSingleStep(0.5)
+        resolution.setValue(2.0)
+        resolution.setToolTip("Upscale factor relative to the current preview size.")
+        form.addRow("Resolution", resolution)
+
+        softness_row = QWidget()
+        softness_layout = QHBoxLayout(softness_row)
+        softness_layout.setContentsMargins(0, 0, 0, 0)
+        softness_layout.setSpacing(6)
+        softness = QSlider(Qt.Horizontal)
+        softness.setRange(0, 100)
+        softness.setValue(0)
+        softness_value_label = QLabel("0.00")
+        softness_value_label.setFixedWidth(30)
+        softness.valueChanged.connect(lambda v: softness_value_label.setText(f"{v / 100:.2f}"))
+        softness_layout.addWidget(softness)
+        softness_layout.addWidget(softness_value_label)
+        softness_row.setToolTip("0.0 = off, 1.0 = maximum softness.")
+        form.addRow("Softness", softness_row)
+
+        quantize = QSpinBox()
+        quantize.setSpecialValueText("None")
+        quantize.setRange(0, 8)
+        quantize.setValue(self._quantize.value())
+        form.addRow("Quantize", quantize)
+
+        seed_row = QWidget()
+        seed_layout = QHBoxLayout(seed_row)
+        seed_layout.setContentsMargins(0, 0, 0, 0)
+        dlg_seed = QSpinBox()
+        dlg_seed.setRange(0, 2_000_000_000)
+        dlg_seed.setValue(0)
+        dlg_random_seed = QCheckBox("Random")
+        dlg_random_seed.setChecked(True)
+        dlg_random_seed.toggled.connect(dlg_seed.setDisabled)
+        dlg_seed.setDisabled(True)
+        seed_layout.addWidget(dlg_seed)
+        seed_layout.addWidget(dlg_random_seed)
+        form.addRow("Seed", seed_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        # --- Run upscale ---
+        upscaled_path = os.path.join(
+            tempfile.gettempdir(), f"kf_upscaled_{os.getpid()}.png"
+        )
+        cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-seedvr2")
+        cmd = [
+            cli_path,
+            "--image-path", self._tmp_output,
+            "--resolution", f"{resolution.value()}x",
+            "--output", upscaled_path,
+        ]
+
+        if softness.value() > 0:
+            cmd += ["--softness", str(softness.value() / 100)]
+
+        if quantize.value() > 0:
+            cmd += ["--quantize", str(quantize.value())]
+
+        if not dlg_random_seed.isChecked():
+            cmd += ["--seed", str(dlg_seed.value())]
+
+        self._on_log_message("Running: " + " ".join(cmd))
+        self._set_busy(True)
+        self._thread = GenerateThread(cmd, upscaled_path)
+        self._thread.finished.connect(self._on_finished)
+        self._thread.errored.connect(self._on_error)
+        self._thread.logged.connect(self._on_log_message)
+        self._thread.progress.connect(self._on_progress)
+        self._thread.start()
+
     # ------------------------------------------------------------------
+
+    def _update_model_ui(self):
+        model_name = self._model.currentText()
+        _, _, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
+            model_name, (None, None, True, True, False)
+        )
+        needs_ref = rest[0] if rest else False
+
+        self._guidance.setVisible(supports_guidance)
+        if self._guidance_label:
+            self._guidance_label.setVisible(supports_guidance)
+
+        self._strength_row.setVisible(supports_strength)
+        if self._strength_label_form:
+            self._strength_label_form.setVisible(supports_strength)
+
+        self._ref_row.setVisible(needs_ref)
+        if self._ref_label:
+            self._ref_label.setVisible(needs_ref)
+
+        self._update_prompt_placeholder()
+
+    def _update_prompt_placeholder(self):
+        model_name = self._model.currentText().strip()
+        edit_models = {"kontext-dev", "kontext-schnell", "flux2-edit", "qwen-edit"}
+        if model_name in edit_models:
+            self._prompt.setPlaceholderText("Describe your changes…")
+        else:
+            self._prompt.setPlaceholderText("Describe your image…")
+
+    def _browse_reference_image(self):
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select reference image", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.tiff)"
+        )
+        if path:
+            self._ref_image.setText(path)
 
     def _update_preview_ratio(self, doc):
         if doc and doc.width() > 0:
@@ -807,9 +1049,12 @@ class KritaiDocker(DockWidget):
                 self._preview.setPixmap(cached)
                 self._preview.setVisible(True)
                 self._use_btn.setEnabled(True)
+                self._upscale_btn.setEnabled(True)
             else:
                 self._preview.setVisible(False)
                 self._use_btn.setEnabled(False)
+                self._upscale_btn.setEnabled(False)
         else:
             self._preview.setVisible(False)
             self._use_btn.setEnabled(False)
+            self._upscale_btn.setEnabled(False)
