@@ -82,7 +82,14 @@ class PreviewLabel(QLabel):
     def setRatio(self, ratio):
         if ratio > 0 and ratio != self._ratio:
             self._ratio = ratio
-            self.updateGeometry()
+            self._update_fixed_height()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_fixed_height()
+
+    def _update_fixed_height(self):
+        self.setFixedHeight(max(1, self.heightForWidth(self.width())))
 
     def setPixmap(self, pixmap):
         self._source = pixmap
