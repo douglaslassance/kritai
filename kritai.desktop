@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=kritai
+X-Krita-Manual=Manual.html
+Name=Kritai
+Comment=Run the canvas through local mflux image generation
