@@ -675,6 +675,7 @@ class KritaiDocker(DockWidget):
         if checked:
             self._last_canvas_hash = self._canvas_hash()
             self._poll_timer.start()
+            self._generate()
         else:
             self._poll_timer.stop()
             self._debounce_timer.stop()
