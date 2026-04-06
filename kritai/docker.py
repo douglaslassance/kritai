@@ -325,7 +325,7 @@ class KritaiDocker(DockWidget):
         for group, models in model_groups.items():
             self._model.insertSeparator(self._model.count())
             # Qt doesn't have native group headers; use a disabled item as label.
-            self._model.addItem(f"── {group} ──")
+            self._model.addItem(group)
             self._model.model().item(self._model.count() - 1).setEnabled(False)
             for m in models:
                 self._model.addItem(m)
