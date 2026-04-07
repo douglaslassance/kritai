@@ -269,34 +269,6 @@ class KritaiDocker(DockWidget):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
 
-        # --- Preview image ---
-        self._preview = PreviewLabel()
-        self._preview.setAlignment(Qt.AlignCenter)
-        self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._preview.setStyleSheet("border-radius: 4px;")
-        self._preview.setVisible(False)
-        outer.addWidget(self._preview)
-
-        # --- Progress bar + cancel button ---
-        progress_row = QHBoxLayout()
-        progress_row.setContentsMargins(0, 0, 0, 0)
-        progress_row.setSpacing(4)
-        self._progress = QProgressBar()
-        self._progress.setRange(0, 100)
-        self._progress.setValue(0)
-        self._progress.setTextVisible(True)
-        self._progress.setFormat("")
-        self._progress.setVisible(False)
-        progress_row.addWidget(self._progress)
-        self._cancel_btn = QToolButton()
-        self._cancel_btn.setIcon(Krita.instance().icon("dialog-cancel"))
-        self._cancel_btn.setToolTip("Cancel")
-        self._cancel_btn.setEnabled(False)
-        self._cancel_btn.setVisible(False)
-        self._cancel_btn.clicked.connect(self._cancel)
-        progress_row.addWidget(self._cancel_btn)
-        outer.addLayout(progress_row)
-
         # --- Model selector ---
         self._model = QComboBox()
         # Groups mirror the model families in the mflux README.
@@ -524,6 +496,34 @@ class KritaiDocker(DockWidget):
         self._log_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._log_btn.toggled.connect(self._on_log_toggled)
         btn_row.addWidget(self._log_btn)
+
+        # --- Progress bar + cancel button ---
+        progress_row = QHBoxLayout()
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.setSpacing(4)
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(True)
+        self._progress.setFormat("")
+        self._progress.setVisible(False)
+        progress_row.addWidget(self._progress)
+        self._cancel_btn = QToolButton()
+        self._cancel_btn.setIcon(Krita.instance().icon("dialog-cancel"))
+        self._cancel_btn.setToolTip("Cancel")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.clicked.connect(self._cancel)
+        progress_row.addWidget(self._cancel_btn)
+        outer.addLayout(progress_row)
+
+        # --- Preview image ---
+        self._preview = PreviewLabel()
+        self._preview.setAlignment(Qt.AlignCenter)
+        self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._preview.setStyleSheet("border-radius: 4px;")
+        self._preview.setVisible(False)
+        outer.addWidget(self._preview)
 
         # --- Log section ---
         self._log = QPlainTextEdit()
