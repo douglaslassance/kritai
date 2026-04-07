@@ -286,15 +286,25 @@ class KritaiDocker(DockWidget):
         self._preview.setVisible(False)
         outer.addWidget(self._preview)
 
-        # --- Progress bar (doubles as status display) ---
+        # --- Progress bar + cancel button ---
+        progress_row = QHBoxLayout()
+        progress_row.setContentsMargins(0, 0, 0, 0)
+        progress_row.setSpacing(4)
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
         self._progress.setTextVisible(True)
         self._progress.setFormat("")
-        self._progress.setFixedHeight(18)
         self._progress.setVisible(False)
-        outer.addWidget(self._progress)
+        progress_row.addWidget(self._progress)
+        self._cancel_btn = QToolButton()
+        self._cancel_btn.setIcon(Krita.instance().icon("dialog-cancel"))
+        self._cancel_btn.setToolTip("Cancel")
+        self._cancel_btn.setEnabled(False)
+        self._cancel_btn.setVisible(False)
+        self._cancel_btn.clicked.connect(self._cancel)
+        progress_row.addWidget(self._cancel_btn)
+        outer.addLayout(progress_row)
 
         # --- Model selector ---
         self._model = QComboBox()
@@ -379,6 +389,7 @@ class KritaiDocker(DockWidget):
             "Describe what you want to avoid in the result.\n"
             "Example: blurry, low quality, extra limbs."
         )
+        self._negative_prompt.setVisible(False)
         outer.addWidget(self._negative_prompt)
 
         # --- Settings ---
@@ -756,7 +767,15 @@ class KritaiDocker(DockWidget):
     def _set_busy(self, busy):
         self._progress.setValue(0)
         self._progress.setVisible(busy)
+        self._cancel_btn.setEnabled(busy)
+        self._cancel_btn.setVisible(busy)
         self._set_status("Generating…" if busy else "")
+
+    def _cancel(self):
+        if self._thread and self._thread.isRunning():
+            self._thread.terminate()
+            self._thread.wait()
+        self._set_busy(False)
 
     def _generate(self):
         from krita import Krita
@@ -836,7 +855,7 @@ class KritaiDocker(DockWidget):
         if not self._random_seed.isChecked():
             cmd += ["--seed", str(self._seed.value())]
 
-        self._on_log_message("Running: " + " ".join(cmd))
+        self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
         self._set_busy(True)
         self._thread = GenerateThread(cmd, self._tmp_output)
         self._thread.finished.connect(self._on_finished)
@@ -976,6 +995,8 @@ class KritaiDocker(DockWidget):
         dlg_progress = QProgressBar()
         dlg_progress.setRange(0, 100)
         dlg_progress.setValue(0)
+        dlg_progress.setTextVisible(True)
+        dlg_progress.setFormat("")
         dlg_progress.setVisible(False)
         layout.addWidget(dlg_progress)
 
@@ -1043,22 +1064,29 @@ class KritaiDocker(DockWidget):
             if not dlg_random_seed.isChecked():
                 cmd += ["--seed", str(dlg_seed.value())]
 
-            self._on_log_message("Running: " + " ".join(cmd))
+            self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
 
             thread = GenerateThread(cmd, upscaled_path)
             # Keep a reference so it isn't garbage-collected.
             dlg._thread = thread
 
-            thread.progress.connect(dlg_progress.setValue)
-            thread.logged.connect(self._on_log_message)
+            def on_upscale_progress(value):
+                dlg_progress.setValue(value)
+                if value > 0:
+                    dlg_progress.setFormat(f"Generating… {value}%")
+
+            def on_upscale_log(text):
+                self._on_log_message(text)
+                if any(kw in text for kw in ("Downloading", "Fetching", "fetching")):
+                    dlg_progress.setFormat("Downloading…")
+
+            thread.progress.connect(on_upscale_progress)
+            thread.logged.connect(on_upscale_log)
 
             def on_finished(path):
-                self._show_preview(path)
-                p = self._doc_previews.get(
-                    doc.fileName() or str(id(doc))
-                )
-                if p:
-                    self._commit_to_layer(p)
+                pix = QPixmap(path)
+                if not pix.isNull():
+                    self._commit_to_layer(pix)
                 dlg.accept()
 
             def on_error(msg):
