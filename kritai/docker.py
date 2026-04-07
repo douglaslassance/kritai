@@ -325,7 +325,7 @@ class KritaiDocker(DockWidget):
 
         # --- Prompt ---
         self._prompt = QPlainTextEdit()
-        self._prompt.setPlaceholderText("Prompt…")
+        self._prompt.setPlaceholderText("Prompt...")
         self._prompt.setToolTip("Describe what you want the image to look like.")
         self._prompt.setFixedHeight(60)
         outer.addWidget(self._prompt)
@@ -480,6 +480,24 @@ class KritaiDocker(DockWidget):
         self._generate_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_row.addWidget(self._generate_btn)
         btn_row.addWidget(self._auto_btn)
+
+        self._fill_btn = QToolButton()
+        self._fill_btn.setToolTip("Modify Selected Region")
+        self._fill_btn.setIcon(Krita.instance().icon("tool_rect_selection"))
+        self._fill_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._fill_btn.setEnabled(False)
+        self._fill_btn.clicked.connect(self._fill_selection)
+        from PyQt5.QtWidgets import QGraphicsOpacityEffect
+        self._fill_opacity = QGraphicsOpacityEffect(self._fill_btn)
+        self._fill_opacity.setOpacity(0.3)
+        self._fill_btn.setGraphicsEffect(self._fill_opacity)
+        btn_row.addWidget(self._fill_btn)
+
+        # Poll selection state to enable/disable fill button.
+        self._sel_poll_timer = QTimer()
+        self._sel_poll_timer.setInterval(500)
+        self._sel_poll_timer.timeout.connect(self._poll_selection)
+        self._sel_poll_timer.start()
 
         self._use_btn = QToolButton()
         self._use_btn.setToolTip("Add result as a new layer in the document")
@@ -719,6 +737,15 @@ class KritaiDocker(DockWidget):
         except Exception:
             return None
 
+    def _poll_selection(self):
+        """Enable/disable fill button based on whether a selection is active."""
+        has_sel = False
+        if self._current_doc:
+            sel = self._current_doc.selection()
+            has_sel = sel is not None and sel.width() > 0 and sel.height() > 0
+        self._fill_btn.setEnabled(has_sel)
+        self._fill_opacity.setOpacity(1.0 if has_sel else 0.3)
+
     def _poll_canvas(self):
         if self._thread and self._thread.isRunning():
             return
@@ -739,7 +766,7 @@ class KritaiDocker(DockWidget):
         self._progress.setVisible(busy)
         self._cancel_btn.setEnabled(busy)
         self._cancel_btn.setVisible(busy)
-        self._set_status("Generating…" if busy else "")
+        self._set_status("Initializing..." if busy else "")
 
     def _cancel(self):
         if self._thread and self._thread.isRunning():
@@ -892,6 +919,248 @@ class KritaiDocker(DockWidget):
         if self._current_doc:
             self._doc_previews[self._current_doc.fileName() or str(id(self._current_doc))] = pixmap
 
+    @staticmethod
+    def _load_fill_settings():
+        from PyQt5.QtCore import QSettings
+        s = QSettings("kritai", "fill")
+        return {
+            "strength": int(s.value("strength", 90)),
+            "steps": int(s.value("steps", 20)),
+            "guidance": float(s.value("guidance", 3.5)),
+            "quantize": int(s.value("quantize", 4)),
+            "seed": int(s.value("seed", 0)),
+            "random_seed": s.value("random_seed", "true") == "true",
+            "prompt": str(s.value("prompt", "")),
+        }
+
+    @staticmethod
+    def _save_fill_settings(data):
+        from PyQt5.QtCore import QSettings
+        s = QSettings("kritai", "fill")
+        for k, v in data.items():
+            s.setValue(k, str(v).lower() if isinstance(v, bool) else v)
+
+    def _fill_selection(self):
+        from krita import Krita
+
+        doc = Krita.instance().activeDocument()
+        if not doc:
+            return
+        sel = doc.selection()
+        if sel is None or sel.width() <= 0 or sel.height() <= 0:
+            return
+
+        sel_x, sel_y, sel_w, sel_h = sel.x(), sel.y(), sel.width(), sel.height()
+
+        saved = self._load_fill_settings()
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Modify Selected Region")
+        layout = QVBoxLayout(dlg)
+
+        # --- Prompt ---
+        prompt_edit = QPlainTextEdit()
+        prompt_edit.setPlaceholderText("Prompt...")
+        prompt_edit.setPlainText(saved["prompt"])
+        prompt_edit.setFixedHeight(60)
+        layout.addWidget(prompt_edit)
+
+        # --- Settings ---
+        form = QFormLayout()
+
+        # Strength
+        strength_row = QWidget()
+        strength_layout = QHBoxLayout(strength_row)
+        strength_layout.setContentsMargins(0, 0, 0, 0)
+        strength_layout.setSpacing(6)
+        fill_strength = QSlider(Qt.Horizontal)
+        fill_strength.setRange(0, 100)
+        fill_strength.setValue(saved["strength"])
+        fill_strength_label = QLabel(f"{fill_strength.value() / 100:.2f}")
+        fill_strength_label.setFixedWidth(30)
+        fill_strength.valueChanged.connect(
+            lambda v: fill_strength_label.setText(f"{v / 100:.2f}")
+        )
+        strength_layout.addWidget(fill_strength)
+        strength_layout.addWidget(fill_strength_label)
+        strength_row.setToolTip(
+            "How much the selection content influences the result.\n"
+            "0.0 = ignore existing content entirely.\n"
+            "1.0 = stay very close to what is already there.\n"
+            "Default: 0.90"
+        )
+        form.addRow("Strength", strength_row)
+
+        steps = QSpinBox()
+        steps.setRange(1, 100)
+        steps.setValue(saved["steps"])
+        form.addRow("Steps", steps)
+
+        guidance = QDoubleSpinBox()
+        guidance.setRange(0.0, 100.0)
+        guidance.setSingleStep(0.5)
+        guidance.setValue(saved["guidance"])
+        form.addRow("Guidance", guidance)
+
+        quantize = QSpinBox()
+        quantize.setSpecialValueText("None")
+        quantize.setRange(0, 8)
+        quantize.setValue(saved["quantize"])
+        form.addRow("Quantize", quantize)
+
+        seed_row = QWidget()
+        seed_layout = QHBoxLayout(seed_row)
+        seed_layout.setContentsMargins(0, 0, 0, 0)
+        dlg_seed = QSpinBox()
+        dlg_seed.setRange(0, 2_000_000_000)
+        dlg_seed.setValue(saved["seed"])
+        dlg_random_seed = QCheckBox("Random")
+        dlg_random_seed.setChecked(saved["random_seed"])
+        dlg_random_seed.toggled.connect(dlg_seed.setDisabled)
+        dlg_seed.setDisabled(dlg_random_seed.isChecked())
+        seed_layout.addWidget(dlg_seed)
+        seed_layout.addWidget(dlg_random_seed)
+        form.addRow("Seed", seed_row)
+
+        layout.addLayout(form)
+
+        # --- Progress ---
+        progress = QProgressBar()
+        progress.setRange(0, 100)
+        progress.setValue(0)
+        progress.setTextVisible(True)
+        progress.setFormat("")
+        progress.setVisible(False)
+        layout.addWidget(progress)
+
+        # --- Buttons ---
+        buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        generate_btn = buttons.addButton("Generate", QDialogButtonBox.AcceptRole)
+        layout.addWidget(buttons)
+        buttons.rejected.connect(dlg.reject)
+
+        dlg._thread = None
+
+        def on_generate():
+            prompt = prompt_edit.toPlainText().strip()
+            if not prompt:
+                return
+
+            # Save settings at Krita level.
+            self._save_fill_settings({
+                "strength": fill_strength.value(),
+                "steps": steps.value(),
+                "guidance": guidance.value(),
+                "quantize": quantize.value(),
+                "seed": dlg_seed.value(),
+                "random_seed": dlg_random_seed.isChecked(),
+                "prompt": prompt,
+            })
+
+            generate_btn.setEnabled(False)
+            progress.setVisible(True)
+            progress.setValue(0)
+            progress.setFormat("Initializing...")
+
+            # Export cropped selection.
+            tmp_in = tempfile.NamedTemporaryFile(suffix="_kf_sel_in.png", delete=False)
+            tmp_in.close()
+            tmp_in_path = tmp_in.name
+
+            bounds = _export_selection_crop(doc, tmp_in_path)
+            if bounds is None:
+                generate_btn.setEnabled(True)
+                progress.setVisible(False)
+                return
+
+            tmp_out = os.path.join(
+                tempfile.gettempdir(), f"kf_sel_out_{os.getpid()}.png"
+            )
+            if os.path.exists(tmp_out):
+                try:
+                    os.remove(tmp_out)
+                except OSError:
+                    pass
+
+            # Build command — always Kontext dev.
+            cli_path = os.path.join(MFLUX_DIR, "mflux-generate-kontext")
+
+            cmd = [
+                cli_path,
+                "--prompt", prompt,
+                "--model", "dev",
+                "--image-path", tmp_in_path,
+                "--image-strength", str(fill_strength.value() / 100),
+                "--steps", str(steps.value()),
+                "--guidance", str(guidance.value()),
+                "--output", tmp_out,
+            ]
+
+            if quantize.value() > 0:
+                cmd += ["--quantize", str(quantize.value())]
+
+            if not dlg_random_seed.isChecked():
+                cmd += ["--seed", str(dlg_seed.value())]
+
+            self._on_log_message("Running: " + " ".join(
+                f'"{t}"' if " " in t else t for t in cmd
+            ))
+
+            thread = GenerateThread(cmd, tmp_out)
+            dlg._thread = thread
+
+            def on_progress(value):
+                progress.setValue(value)
+                if value > 0:
+                    progress.setFormat(f"Generating... {value}%")
+
+            def on_log(text):
+                self._on_log_message(text)
+                if any(kw in text for kw in ("Downloading", "Fetching", "fetching")):
+                    progress.setFormat("Downloading...")
+
+            def on_finished(output_path):
+                result_img = QImage(output_path)
+                if result_img.isNull():
+                    generate_btn.setEnabled(True)
+                    progress.setVisible(False)
+                    return
+
+                result_img = result_img.convertToFormat(QImage.Format_ARGB32)
+                if result_img.width() != sel_w or result_img.height() != sel_h:
+                    result_img = result_img.scaled(
+                        sel_w, sel_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+                    )
+
+                layer = doc.createNode("Kritai Fill", "paintlayer")
+                doc.rootNode().addChildNode(layer, None)
+                ptr = result_img.bits()
+                ptr.setsize(result_img.byteCount())
+                layer.setPixelData(bytes(ptr), sel_x, sel_y, sel_w, sel_h)
+                doc.refreshProjection()
+
+                for p in (tmp_in_path, tmp_out):
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+                dlg.accept()
+
+            def on_error(msg):
+                self._on_error(msg)
+                generate_btn.setEnabled(True)
+                progress.setVisible(False)
+
+            thread.progress.connect(on_progress)
+            thread.logged.connect(on_log)
+            thread.finished.connect(on_finished)
+            thread.errored.connect(on_error)
+            thread.start()
+
+        generate_btn.clicked.connect(on_generate)
+        dlg.exec_()
+
     def _import_to_layer(self):
         doc = self._current_doc
         if not doc:
@@ -995,6 +1264,7 @@ class KritaiDocker(DockWidget):
             buttons.button(QDialogButtonBox.Ok).setEnabled(False)
             dlg_progress.setVisible(True)
             dlg_progress.setValue(0)
+            dlg_progress.setFormat("Initializing...")
 
             upscale_factor = 1.0 / scale
             upscaled_path = os.path.join(
@@ -1099,16 +1369,6 @@ class KritaiDocker(DockWidget):
         if self._ref_label:
             self._ref_label.setVisible(needs_ref)
 
-        self._update_prompt_placeholder()
-
-    def _update_prompt_placeholder(self):
-        model_name = self._model.currentText().strip()
-        edit_models = {"kontext-dev", "kontext-schnell", "flux2-edit", "qwen-edit"}
-        if model_name in edit_models:
-            self._prompt.setPlaceholderText("Describe your changes…")
-        else:
-            self._prompt.setPlaceholderText("Describe your image…")
-
     def _browse_reference_image(self):
         from PyQt5.QtWidgets import QFileDialog
         path, _ = QFileDialog.getOpenFileName(
@@ -1143,3 +1403,36 @@ class KritaiDocker(DockWidget):
         else:
             self._preview.setVisible(False)
             self._use_btn.setEnabled(False)
+
+
+def _export_selection_crop(doc, path):
+    """Export the canvas region covered by the current selection to *path*.
+
+    Returns ``(x, y, w, h)`` of the selection bounds, or ``None`` if there is
+    no selection.
+    """
+    sel = doc.selection()
+    if sel is None:
+        return None
+    sx, sy, sw, sh = sel.x(), sel.y(), sel.width(), sel.height()
+    if sw <= 0 or sh <= 0:
+        return None
+
+    tmp_full = tempfile.NamedTemporaryFile(suffix="_kf_full.png", delete=False)
+    tmp_full.close()
+    try:
+        doc.setBatchmode(True)
+        doc.exportImage(tmp_full.name, InfoObject())
+        doc.setBatchmode(False)
+        full_img = QImage(tmp_full.name)
+    finally:
+        try:
+            os.unlink(tmp_full.name)
+        except OSError:
+            pass
+    if full_img.isNull():
+        return None
+
+    cropped = full_img.copy(sx, sy, sw, sh)
+    cropped.save(path, "PNG")
+    return (sx, sy, sw, sh)
