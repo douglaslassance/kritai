@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -244,8 +245,9 @@ class KritaiDocker(DockWidget):
         self._tmp_output = None
         self._last_canvas_hash = None
         self._current_doc = None
-        self._doc_previews = {}   # uid → QPixmap, session only
-        self._doc_settings = {}   # uid → settings dict, session only
+        self._doc_previews = {}    # uid → QPixmap, session only
+        self._doc_settings = {}    # uid → settings dict, session only
+        self._upscale_settings = {}  # uid → upscale options dict, session only
 
         # Flush settings to annotation only when Krita saves the file.
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
@@ -463,17 +465,26 @@ class KritaiDocker(DockWidget):
         self._ref_row = ref_row
         self._ref_label = form.labelForField(ref_row)
 
-        self._resolution_scale = QDoubleSpinBox()
-        self._resolution_scale.setRange(0.1, 4.0)
-        self._resolution_scale.setSingleStep(0.25)
-        self._resolution_scale.setValue(0.5)
-        self._resolution_scale.setSuffix("")
-        self._resolution_scale.setToolTip(
-            "Scale of the canvas sent to mflux relative to its original size.\n"
-            "0.5× = half resolution (faster, less VRAM).\n"
-            "1.0× = full resolution."
+        scale_row = QWidget()
+        scale_layout = QHBoxLayout(scale_row)
+        scale_layout.setContentsMargins(0, 0, 0, 0)
+        scale_layout.setSpacing(6)
+        self._scale = QSlider(Qt.Horizontal)
+        self._scale.setRange(0, 100)
+        self._scale.setValue(50)
+        self._scale_label = QLabel("0.50")
+        self._scale_label.setFixedWidth(30)
+        self._scale.valueChanged.connect(
+            lambda v: self._scale_label.setText(f"{v / 100:.2f}")
         )
-        form.addRow("Scale", self._resolution_scale)
+        scale_layout.addWidget(self._scale)
+        scale_layout.addWidget(self._scale_label)
+        scale_row.setToolTip(
+            "Scale of the canvas sent to mflux relative to its original size.\n"
+            "0.5 = half resolution (faster, less VRAM).\n"
+            "1.0 = full resolution."
+        )
+        form.addRow("Scale", scale_row)
 
         seed_row = QWidget()
         seed_layout = QHBoxLayout(seed_row)
@@ -510,13 +521,6 @@ class KritaiDocker(DockWidget):
         self._generate_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         btn_row.addWidget(self._generate_btn)
         btn_row.addWidget(self._auto_btn)
-
-        self._upscale_btn = QPushButton()
-        self._upscale_btn.setIcon(Krita.instance().icon("zoom-in"))
-        self._upscale_btn.setToolTip("Upscale preview using SeedVR2")
-        self._upscale_btn.setEnabled(False)
-        self._upscale_btn.clicked.connect(self._upscale)
-        btn_row.addWidget(self._upscale_btn)
 
         self._use_btn = QToolButton()
         self._use_btn.setToolTip("Add result as a new layer in the document")
@@ -570,7 +574,7 @@ class KritaiDocker(DockWidget):
             self._steps.valueChanged,
             self._guidance.valueChanged,
             self._strength.valueChanged,
-            self._resolution_scale.valueChanged,
+            self._scale.valueChanged,
             self._seed.valueChanged,
             self._random_seed.toggled,
         ]:
@@ -590,7 +594,7 @@ class KritaiDocker(DockWidget):
             self._steps.valueChanged,
             self._guidance.valueChanged,
             self._strength.valueChanged,
-            self._resolution_scale.valueChanged,
+            self._scale.valueChanged,
             self._seed.valueChanged,
             self._random_seed.toggled,
         ]:
@@ -604,7 +608,8 @@ class KritaiDocker(DockWidget):
         doc = self._current_doc
         if not doc:
             return
-        self._doc_settings[doc.fileName() or str(id(doc))] = {
+        uid = doc.fileName() or str(id(doc))
+        new = {
             "prompt": self._prompt.toPlainText(),
             "negative_prompt": self._negative_prompt.text(),
             "reference_image": self._ref_image.text(),
@@ -613,10 +618,15 @@ class KritaiDocker(DockWidget):
             "steps": self._steps.value(),
             "guidance": self._guidance.value(),
             "strength": self._strength.value() / 100,
-            "resolution_scale": self._resolution_scale.value(),
+            "scale": self._scale.value() / 100,
             "seed": self._seed.value(),
             "random_seed": self._random_seed.isChecked(),
+            "upscale": self._upscale_settings.get(uid, {}),
         }
+        prev = self._doc_settings.get(uid)
+        self._doc_settings[uid] = new
+        if prev != new:
+            doc.setModified(True)
 
     def _on_image_saved(self, filename):
         """Flush in-memory settings to the document annotation on save."""
@@ -626,6 +636,9 @@ class KritaiDocker(DockWidget):
                 if data:
                     raw = json.dumps(data).encode("utf-8")
                     doc.setAnnotation(self.ANNOTATION_TYPE, "Kritai settings", QByteArray(raw))
+                    # setAnnotation marks the doc modified; clear it since we
+                    # just saved.
+                    doc.setModified(False)
                 break
 
     def _load_settings(self, doc):
@@ -648,7 +661,7 @@ class KritaiDocker(DockWidget):
         widgets = [
             self._prompt, self._negative_prompt, self._ref_image, self._model,
             self._quantize, self._steps, self._guidance,
-            self._strength, self._resolution_scale, self._seed, self._random_seed,
+            self._strength, self._scale, self._seed, self._random_seed,
         ]
         for w in widgets:
             w.blockSignals(True)
@@ -664,9 +677,14 @@ class KritaiDocker(DockWidget):
         self._steps.setValue(data.get("steps", 20))
         self._guidance.setValue(data.get("guidance", 3.5))
         self._strength.setValue(int(data.get("strength", 0.75) * 100))
-        self._resolution_scale.setValue(data.get("resolution_scale", 0.5))
+        self._scale.setValue(int(data.get("scale", data.get("downscale", data.get("resolution_scale", 0.5))) * 100))
         self._seed.setValue(data.get("seed", 0))
         self._random_seed.setChecked(data.get("random_seed", False))
+
+        # Restore upscale settings.
+        upscale = data.get("upscale")
+        if upscale:
+            self._upscale_settings[uid] = upscale
         self._seed.setDisabled(self._random_seed.isChecked())
 
         for w in widgets:
@@ -689,7 +707,7 @@ class KritaiDocker(DockWidget):
 
     def _export_scaled(self, doc, path):
         """Export the canvas to path, scaled by the resolution scale factor."""
-        scale = self._resolution_scale.value()
+        scale = self._scale.value() / 100
         doc.setBatchmode(True)
         doc.exportImage(path, InfoObject())
         doc.setBatchmode(False)
@@ -875,7 +893,6 @@ class KritaiDocker(DockWidget):
         self._preview.setPixmap(pixmap)
         self._preview.setVisible(True)
         self._use_btn.setEnabled(True)
-        self._upscale_btn.setEnabled(True)
         if self._current_doc:
             self._doc_previews[self._current_doc.fileName() or str(id(self._current_doc))] = pixmap
 
@@ -887,7 +904,181 @@ class KritaiDocker(DockWidget):
         if not pixmap:
             return
 
-        # Convert the cached pixmap and scale it to the document dimensions.
+        uid = doc.fileName() or str(id(doc))
+        scale = self._scale.value() / 100
+        can_upscale = (
+            scale < 1.0
+            and self._tmp_output
+            and os.path.exists(self._tmp_output)
+            and not (self._thread and self._thread.isRunning())
+        )
+
+        # Restore previous upscale settings for this document.
+        saved = self._upscale_settings.get(uid, {})
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Import as Layer")
+        layout = QVBoxLayout(dlg)
+
+        # --- Checkable upscale group ---
+        upscale_group = QGroupBox("Upscale")
+        upscale_group.setCheckable(True)
+        upscale_group.setChecked(can_upscale)
+        upscale_group.setEnabled(can_upscale)
+        upscale_group.setToolTip("If needed, the image will be upscaled to fit the canvas size.")
+        upscale_form = QFormLayout(upscale_group)
+
+        model = QComboBox()
+        model.addItems(["seedvr2", "controlnet"])
+        idx = model.findText(saved.get("model", "seedvr2"))
+        if idx >= 0:
+            model.setCurrentIndex(idx)
+        upscale_form.addRow("Model", model)
+
+        softness_row = QWidget()
+        softness_layout = QHBoxLayout(softness_row)
+        softness_layout.setContentsMargins(0, 0, 0, 0)
+        softness_layout.setSpacing(6)
+        softness = QSlider(Qt.Horizontal)
+        softness.setRange(0, 100)
+        softness.setValue(saved.get("softness", 0))
+        softness_value_label = QLabel(f"{softness.value() / 100:.2f}")
+        softness_value_label.setFixedWidth(30)
+        softness.valueChanged.connect(lambda v: softness_value_label.setText(f"{v / 100:.2f}"))
+        softness_layout.addWidget(softness)
+        softness_layout.addWidget(softness_value_label)
+        softness_row.setToolTip("0.0 = off, 1.0 = maximum softness.")
+        upscale_form.addRow("Softness", softness_row)
+
+        quantize = QSpinBox()
+        quantize.setSpecialValueText("None")
+        quantize.setRange(0, 8)
+        quantize.setValue(saved.get("quantize", self._quantize.value()))
+        upscale_form.addRow("Quantize", quantize)
+
+        seed_row = QWidget()
+        seed_layout = QHBoxLayout(seed_row)
+        seed_layout.setContentsMargins(0, 0, 0, 0)
+        dlg_seed = QSpinBox()
+        dlg_seed.setRange(0, 2_000_000_000)
+        dlg_seed.setValue(saved.get("seed", 0))
+        dlg_random_seed = QCheckBox("Random")
+        dlg_random_seed.setChecked(saved.get("random_seed", True))
+        dlg_random_seed.toggled.connect(dlg_seed.setDisabled)
+        dlg_seed.setDisabled(dlg_random_seed.isChecked())
+        seed_layout.addWidget(dlg_seed)
+        seed_layout.addWidget(dlg_random_seed)
+        upscale_form.addRow("Seed", seed_row)
+
+        layout.addWidget(upscale_group)
+
+        # --- Progress bar (hidden until upscale starts) ---
+        dlg_progress = QProgressBar()
+        dlg_progress.setRange(0, 100)
+        dlg_progress.setValue(0)
+        dlg_progress.setVisible(False)
+        layout.addWidget(dlg_progress)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("Import")
+        layout.addWidget(buttons)
+
+        def save_upscale_settings():
+            self._upscale_settings[uid] = {
+                "model": model.currentText(),
+                "softness": softness.value(),
+                "quantize": quantize.value(),
+                "seed": dlg_seed.value(),
+                "random_seed": dlg_random_seed.isChecked(),
+            }
+
+        def on_import():
+            save_upscale_settings()
+
+            if not upscale_group.isChecked():
+                self._commit_to_layer(pixmap)
+                dlg.accept()
+                return
+
+            # Disable controls and show progress.
+            upscale_group.setEnabled(False)
+            buttons.button(QDialogButtonBox.Ok).setEnabled(False)
+            dlg_progress.setVisible(True)
+            dlg_progress.setValue(0)
+
+            upscale_factor = 1.0 / scale
+            upscaled_path = os.path.join(
+                tempfile.gettempdir(), f"kf_upscaled_{os.getpid()}.png"
+            )
+            # Remove stale file — mflux won't overwrite an existing path.
+            if os.path.exists(upscaled_path):
+                os.remove(upscaled_path)
+
+            selected_model = model.currentText()
+            if selected_model == "controlnet":
+                cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-controlnet")
+                target_w = doc.width()
+                target_h = doc.height()
+                cmd = [
+                    cli_path,
+                    "--controlnet-image-path", self._tmp_output,
+                    "--width", str(target_w),
+                    "--height", str(target_h),
+                    "--prompt", self._prompt.toPlainText() or "",
+                    "--output", upscaled_path,
+                ]
+            else:
+                cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-seedvr2")
+                cmd = [
+                    cli_path,
+                    "--image-path", self._tmp_output,
+                    "--resolution", f"{upscale_factor}x",
+                    "--output", upscaled_path,
+                ]
+                if softness.value() > 0:
+                    cmd += ["--softness", str(softness.value() / 100)]
+
+            if quantize.value() > 0:
+                cmd += ["--quantize", str(quantize.value())]
+            if not dlg_random_seed.isChecked():
+                cmd += ["--seed", str(dlg_seed.value())]
+
+            self._on_log_message("Running: " + " ".join(cmd))
+
+            thread = GenerateThread(cmd, upscaled_path)
+            # Keep a reference so it isn't garbage-collected.
+            dlg._thread = thread
+
+            thread.progress.connect(dlg_progress.setValue)
+            thread.logged.connect(self._on_log_message)
+
+            def on_finished(path):
+                self._show_preview(path)
+                p = self._doc_previews.get(
+                    doc.fileName() or str(id(doc))
+                )
+                if p:
+                    self._commit_to_layer(p)
+                dlg.accept()
+
+            def on_error(msg):
+                self._on_error(msg)
+                dlg.reject()
+
+            thread.finished.connect(on_finished)
+            thread.errored.connect(on_error)
+            thread.start()
+
+        buttons.accepted.connect(on_import)
+        buttons.rejected.connect(dlg.reject)
+
+        dlg.exec_()
+
+    def _commit_to_layer(self, pixmap):
+        doc = self._current_doc
+        if not doc:
+            return
+
         img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
         if img.isNull():
             return
@@ -903,100 +1094,6 @@ class KritaiDocker(DockWidget):
 
         # Stop auto mode now that the result is committed to the document.
         self._auto_btn.setChecked(False)
-
-    def _upscale(self):
-        if not self._tmp_output or not os.path.exists(self._tmp_output):
-            self._set_status("No preview to upscale.")
-            return
-        if self._thread and self._thread.isRunning():
-            return
-
-        # --- Modal options dialog ---
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Upscale Options")
-        layout = QVBoxLayout(dlg)
-        form = QFormLayout()
-        layout.addLayout(form)
-
-        resolution = QDoubleSpinBox()
-        resolution.setRange(1.0, 8.0)
-        resolution.setSingleStep(0.5)
-        resolution.setValue(2.0)
-        resolution.setToolTip("Upscale factor relative to the current preview size.")
-        form.addRow("Resolution", resolution)
-
-        softness_row = QWidget()
-        softness_layout = QHBoxLayout(softness_row)
-        softness_layout.setContentsMargins(0, 0, 0, 0)
-        softness_layout.setSpacing(6)
-        softness = QSlider(Qt.Horizontal)
-        softness.setRange(0, 100)
-        softness.setValue(0)
-        softness_value_label = QLabel("0.00")
-        softness_value_label.setFixedWidth(30)
-        softness.valueChanged.connect(lambda v: softness_value_label.setText(f"{v / 100:.2f}"))
-        softness_layout.addWidget(softness)
-        softness_layout.addWidget(softness_value_label)
-        softness_row.setToolTip("0.0 = off, 1.0 = maximum softness.")
-        form.addRow("Softness", softness_row)
-
-        quantize = QSpinBox()
-        quantize.setSpecialValueText("None")
-        quantize.setRange(0, 8)
-        quantize.setValue(self._quantize.value())
-        form.addRow("Quantize", quantize)
-
-        seed_row = QWidget()
-        seed_layout = QHBoxLayout(seed_row)
-        seed_layout.setContentsMargins(0, 0, 0, 0)
-        dlg_seed = QSpinBox()
-        dlg_seed.setRange(0, 2_000_000_000)
-        dlg_seed.setValue(0)
-        dlg_random_seed = QCheckBox("Random")
-        dlg_random_seed.setChecked(True)
-        dlg_random_seed.toggled.connect(dlg_seed.setDisabled)
-        dlg_seed.setDisabled(True)
-        seed_layout.addWidget(dlg_seed)
-        seed_layout.addWidget(dlg_random_seed)
-        form.addRow("Seed", seed_row)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(dlg.accept)
-        buttons.rejected.connect(dlg.reject)
-        layout.addWidget(buttons)
-
-        if dlg.exec_() != QDialog.Accepted:
-            return
-
-        # --- Run upscale ---
-        upscaled_path = os.path.join(
-            tempfile.gettempdir(), f"kf_upscaled_{os.getpid()}.png"
-        )
-        cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-seedvr2")
-        cmd = [
-            cli_path,
-            "--image-path", self._tmp_output,
-            "--resolution", f"{resolution.value()}x",
-            "--output", upscaled_path,
-        ]
-
-        if softness.value() > 0:
-            cmd += ["--softness", str(softness.value() / 100)]
-
-        if quantize.value() > 0:
-            cmd += ["--quantize", str(quantize.value())]
-
-        if not dlg_random_seed.isChecked():
-            cmd += ["--seed", str(dlg_seed.value())]
-
-        self._on_log_message("Running: " + " ".join(cmd))
-        self._set_busy(True)
-        self._thread = GenerateThread(cmd, upscaled_path)
-        self._thread.finished.connect(self._on_finished)
-        self._thread.errored.connect(self._on_error)
-        self._thread.logged.connect(self._on_log_message)
-        self._thread.progress.connect(self._on_progress)
-        self._thread.start()
 
     # ------------------------------------------------------------------
 
@@ -1057,12 +1154,9 @@ class KritaiDocker(DockWidget):
                 self._preview.setPixmap(cached)
                 self._preview.setVisible(True)
                 self._use_btn.setEnabled(True)
-                self._upscale_btn.setEnabled(True)
             else:
                 self._preview.setVisible(False)
                 self._use_btn.setEnabled(False)
-                self._upscale_btn.setEnabled(False)
         else:
             self._preview.setVisible(False)
             self._use_btn.setEnabled(False)
-            self._upscale_btn.setEnabled(False)
