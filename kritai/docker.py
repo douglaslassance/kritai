@@ -692,21 +692,11 @@ class KritaiDocker(DockWidget):
             self._poll_timer.stop()
             self._debounce_timer.stop()
 
-    def _export_scaled(self, doc, path):
-        """Export the canvas to path, scaled by the resolution scale factor."""
-        scale = self._scale.value() / 100
+    def _export_canvas(self, doc, path):
+        """Export the canvas to *path* at full resolution."""
         doc.setBatchmode(True)
         doc.exportImage(path, InfoObject())
         doc.setBatchmode(False)
-
-        if abs(scale - 1.0) < 0.001:
-            return
-        img = QImage(path)
-        if img.isNull():
-            return
-        new_w = max(1, int(img.width() * scale))
-        new_h = max(1, int(img.height() * scale))
-        img.scaled(new_w, new_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(path, "PNG")
 
     def _canvas_hash(self):
         """Return a hash of a small in-memory thumbnail — no disk I/O."""
@@ -788,7 +778,11 @@ class KritaiDocker(DockWidget):
             tempfile.gettempdir(), f"kf_output_{os.getpid()}.png"
         )
 
-        self._export_scaled(doc, self._tmp_input)
+        self._export_canvas(doc, self._tmp_input)
+
+        scale = self._scale.value() / 100
+        target_w = max(1, int(doc.width() * scale))
+        target_h = max(1, int(doc.height() * scale))
 
         model_name = self._model.currentText()
         cli_name, model_flag, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
@@ -814,6 +808,9 @@ class KritaiDocker(DockWidget):
             "--steps", str(self._steps.value()),
             "--output", self._tmp_output,
         ]
+
+        if abs(scale - 1.0) >= 0.001:
+            cmd += ["--width", str(target_w), "--height", str(target_h)]
 
         if supports_guidance:
             cmd += ["--guidance", str(self._guidance.value())]
