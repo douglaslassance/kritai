@@ -48,12 +48,6 @@ MODEL_CLI = {
     "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
     # FLUX.2 edit — canvas + optional reference image via --image-paths
     "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, True,  True),
-    # Z-Image
-    "z-image-turbo":       ("mflux-generate-z-image-turbo", None,               True,  False, False),
-    "z-image":             ("mflux-generate-z-image",     None,                 True,  True,  False),
-    # FIBO
-    "fibo":                ("mflux-generate-fibo",        "fibo",               True,  True,  False),
-    "fibo-lite":           ("mflux-generate-fibo",        "fibo-lite",          True,  True,  False),
     # Qwen
     "qwen":                ("mflux-generate-qwen",        None,                 True,  True,  False),
     # Qwen edit — canvas + optional reference image via --image-paths
@@ -61,9 +55,6 @@ MODEL_CLI = {
     # Kontext (image editing via instruction)
     "kontext-dev":         ("mflux-generate-kontext",     "dev",                True,  True,  False),
     "kontext-schnell":     ("mflux-generate-kontext",     "schnell",            True,  False, False),
-    # FLUX.1 (legacy)
-    "dev":                 ("mflux-generate",             "dev",                True,  True,  False),
-    "schnell":             ("mflux-generate",             "schnell",            True,  False, False),
 }
 
 # How often (ms) to poll canvas for changes when auto-mode is on.
@@ -317,16 +308,10 @@ class KritaiDocker(DockWidget):
             "flux2-klein-base-4b": "Non-distilled 4B base model. Supports guidance. Needs more steps.",
             "flux2-klein-base-9b": "Non-distilled 9B base model. Best quality in the FLUX.2 family.",
             "flux2-edit":          "Edit the canvas with a prompt and an optional reference image.",
-            "z-image-turbo":       "Fast distilled variant. No guidance.",
-            "z-image":             "Full model. Supports guidance.",
-            "fibo":                "Generation model with strong style capabilities.",
-            "fibo-lite":           "Lighter and faster variant.",
             "qwen":                "Qwen-based generation. Supports guidance.",
             "qwen-edit":           "Instruction-based canvas editing with an optional reference image.",
             "kontext-dev":         "High-quality instruction-based image editing.",
             "kontext-schnell":     "Faster distilled variant. No guidance.",
-            "dev":                 "Original full-quality model. Supports guidance.",
-            "schnell":             "Fast distilled variant. No guidance.",
         }
         model_groups = {
             "FLUX.2 (recommended)": [
@@ -336,14 +321,6 @@ class KritaiDocker(DockWidget):
                 "flux2-klein-base-9b",
                 "flux2-edit",
             ],
-            "Z-Image": [
-                "z-image-turbo",
-                "z-image",
-            ],
-            "FIBO": [
-                "fibo",
-                "fibo-lite",
-            ],
             "Qwen": [
                 "qwen",
                 "qwen-edit",
@@ -351,10 +328,6 @@ class KritaiDocker(DockWidget):
             "Kontext": [
                 "kontext-dev",
                 "kontext-schnell",
-            ],
-            "FLUX.1 (legacy)": [
-                "dev",
-                "schnell",
             ],
         }
         for group, models in model_groups.items():
@@ -366,14 +339,17 @@ class KritaiDocker(DockWidget):
                 self._model.addItem(m)
                 idx = self._model.count() - 1
                 self._model.setItemData(idx, model_tooltips.get(m, ""), Qt.ToolTipRole)
-        self._model.setCurrentIndex(self._model.findText("dev"))
+        self._model.setCurrentIndex(self._model.findText("flux2-klein-4b"))
         self._model.setToolTip(
             "Which mflux model family to use for generation.\n"
-            "FLUX.2 and Z-Image are the fastest and highest quality.\n"
-            "FLUX.1 (dev/schnell) are older but widely supported."
+            "FLUX.2 is the fastest and highest quality.\n"
+            "Qwen and Kontext offer instruction-based editing."
         )
         self._model.currentIndexChanged.connect(self._update_model_ui)
-        outer.addWidget(self._model)
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model"))
+        model_row.addWidget(self._model, 1)
+        outer.addLayout(model_row)
 
         # --- Prompt ---
         self._prompt = QPlainTextEdit()
@@ -947,13 +923,6 @@ class KritaiDocker(DockWidget):
         upscale_group.setToolTip("If needed, the image will be upscaled to fit the canvas size.")
         upscale_form = QFormLayout(upscale_group)
 
-        model = QComboBox()
-        model.addItems(["seedvr2", "controlnet"])
-        idx = model.findText(saved.get("model", "seedvr2"))
-        if idx >= 0:
-            model.setCurrentIndex(idx)
-        upscale_form.addRow("Model", model)
-
         softness_row = QWidget()
         softness_layout = QHBoxLayout(softness_row)
         softness_layout.setContentsMargins(0, 0, 0, 0)
@@ -1006,7 +975,6 @@ class KritaiDocker(DockWidget):
 
         def save_upscale_settings():
             self._upscale_settings[uid] = {
-                "model": model.currentText(),
                 "softness": softness.value(),
                 "quantize": quantize.value(),
                 "seed": dlg_seed.value(),
@@ -1035,29 +1003,15 @@ class KritaiDocker(DockWidget):
             if os.path.exists(upscaled_path):
                 os.remove(upscaled_path)
 
-            selected_model = model.currentText()
-            if selected_model == "controlnet":
-                cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-controlnet")
-                target_w = doc.width()
-                target_h = doc.height()
-                cmd = [
-                    cli_path,
-                    "--controlnet-image-path", self._tmp_output,
-                    "--width", str(target_w),
-                    "--height", str(target_h),
-                    "--prompt", self._prompt.toPlainText() or "",
-                    "--output", upscaled_path,
-                ]
-            else:
-                cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-seedvr2")
-                cmd = [
-                    cli_path,
-                    "--image-path", self._tmp_output,
-                    "--resolution", f"{upscale_factor}x",
-                    "--output", upscaled_path,
-                ]
-                if softness.value() > 0:
-                    cmd += ["--softness", str(softness.value() / 100)]
+            cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-seedvr2")
+            cmd = [
+                cli_path,
+                "--image-path", self._tmp_output,
+                "--resolution", f"{upscale_factor}x",
+                "--output", upscaled_path,
+            ]
+            if softness.value() > 0:
+                cmd += ["--softness", str(softness.value() / 100)]
 
             if quantize.value() > 0:
                 cmd += ["--quantize", str(quantize.value())]
