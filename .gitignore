@@ -14,6 +14,9 @@ build/
 env/
 venv/
 
+# Generated
+kritai/Manual.html
+
 # macOS
 .DS_Store
 .AppleDouble
