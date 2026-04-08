@@ -1632,8 +1632,13 @@ class KritaiDocker(DockWidget):
         row_layout.addWidget(prompt_edit, 1)
         row_layout.addWidget(remove_btn)
 
+        prompt_edit.textChanged.connect(self._update_generate_btn)
+        enabled_cb.toggled.connect(self._update_generate_btn)
+        thumb.pathChanged.connect(self._update_generate_btn)
+
         self._ref_list.addWidget(row)
         self._ref_entries.append((enabled_cb, thumb, prompt_edit, row))
+        self._update_generate_btn()
 
     def _remove_ref_row(self, row: QWidget) -> None:
         self._ref_entries = [
@@ -1641,13 +1646,14 @@ class KritaiDocker(DockWidget):
         ]
         self._ref_list.removeWidget(row)
         row.deleteLater()
+        self._update_generate_btn()
 
     def _build_prompt(self) -> str:
         """Assemble the main prompt with per-reference-image descriptions."""
+        parts: list[str] = []
         main = self._prompt.toPlainText().strip()
-        if not main:
-            return ""
-        parts = [main]
+        if main:
+            parts.append(main)
         idx = 0
         for enabled_cb, thumb, prompt_edit, _ in self._ref_entries:
             if not enabled_cb.isChecked():
