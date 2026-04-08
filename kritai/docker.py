@@ -744,14 +744,19 @@ class KritaiDocker(DockWidget):
 
     def _on_image_saved(self, filename: str) -> None:
         """Flush in-memory settings to the document annotation on save."""
+        # Ensure in-memory settings are up-to-date before flushing.
+        self._save_settings()
         for doc in Krita.instance().documents():
             if doc.fileName() == filename:
-                data = self._doc_settings.get(doc.fileName() or str(id(doc)))
+                uid = doc.fileName() or str(id(doc))
+                # Migrate settings stored under the old id-based key (before first save).
+                old_uid = str(id(doc))
+                if old_uid != uid and old_uid in self._doc_settings:
+                    self._doc_settings[uid] = self._doc_settings.pop(old_uid)
+                data = self._doc_settings.get(uid)
                 if data:
                     raw = json.dumps(data).encode("utf-8")
                     doc.setAnnotation(self.ANNOTATION_TYPE, "Kritai settings", QByteArray(raw))
-                    # setAnnotation marks the doc modified; clear it since we
-                    # just saved.
                     doc.setModified(False)
                 break
 
