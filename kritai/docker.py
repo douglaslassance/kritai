@@ -458,13 +458,20 @@ class KritaiDocker(DockWidget):
         self._strength = QSlider(Qt.Horizontal)
         self._strength.setRange(0, 100)
         self._strength.setValue(75)
-        self._strength_label = QLabel("0.60")
-        self._strength_label.setFixedWidth(30)
+        self._strength_spin = QDoubleSpinBox()
+        self._strength_spin.setRange(0.0, 1.0)
+        self._strength_spin.setSingleStep(0.01)
+        self._strength_spin.setDecimals(2)
+        self._strength_spin.setValue(self._strength.value() / 100)
+        self._strength_spin.setFixedWidth(60)
         self._strength.valueChanged.connect(
-            lambda v: self._strength_label.setText(f"{v / 100:.2f}")
+            lambda v: self._strength_spin.setValue(v / 100)
+        )
+        self._strength_spin.valueChanged.connect(
+            lambda v: self._strength.setValue(int(v * 100))
         )
         strength_layout.addWidget(self._strength)
-        strength_layout.addWidget(self._strength_label)
+        strength_layout.addWidget(self._strength_spin)
         strength_row.setToolTip(
             "How much the canvas influences the result.\n"
             "0.0 = output ignores your painting entirely.\n"
@@ -482,13 +489,20 @@ class KritaiDocker(DockWidget):
         self._scale = QSlider(Qt.Horizontal)
         self._scale.setRange(0, 100)
         self._scale.setValue(50)
-        self._scale_label = QLabel("0.50")
-        self._scale_label.setFixedWidth(30)
+        self._scale_spin = QDoubleSpinBox()
+        self._scale_spin.setRange(0.0, 1.0)
+        self._scale_spin.setSingleStep(0.01)
+        self._scale_spin.setDecimals(2)
+        self._scale_spin.setValue(self._scale.value() / 100)
+        self._scale_spin.setFixedWidth(60)
         self._scale.valueChanged.connect(
-            lambda v: self._scale_label.setText(f"{v / 100:.2f}")
+            lambda v: self._scale_spin.setValue(v / 100)
+        )
+        self._scale_spin.valueChanged.connect(
+            lambda v: self._scale.setValue(int(v * 100))
         )
         scale_layout.addWidget(self._scale)
-        scale_layout.addWidget(self._scale_label)
+        scale_layout.addWidget(self._scale_spin)
         scale_row.setToolTip(
             "Scale of the canvas sent to mflux relative to its original size.\n"
             "0.5 = half resolution (faster, less VRAM).\n"
@@ -781,10 +795,10 @@ class KritaiDocker(DockWidget):
         self._guidance.setValue(data.get("guidance", 3.5))
         strength_val = int(data.get("strength", 0.75) * 100)
         self._strength.setValue(strength_val)
-        self._strength_label.setText(f"{strength_val / 100:.2f}")
+        self._strength_spin.setValue(strength_val / 100)
         scale_val = int(data.get("scale", data.get("downscale", data.get("resolution_scale", 0.5))) * 100)
         self._scale.setValue(scale_val)
-        self._scale_label.setText(f"{scale_val / 100:.2f}")
+        self._scale_spin.setValue(scale_val / 100)
         self._seed.setValue(data.get("seed", 0))
         self._random_seed.setChecked(data.get("random_seed", False))
 
@@ -1095,13 +1109,20 @@ class KritaiDocker(DockWidget):
         fill_strength = QSlider(Qt.Horizontal)
         fill_strength.setRange(0, 100)
         fill_strength.setValue(saved["strength"])
-        fill_strength_label = QLabel(f"{fill_strength.value() / 100:.2f}")
-        fill_strength_label.setFixedWidth(30)
+        fill_strength_spin = QDoubleSpinBox()
+        fill_strength_spin.setRange(0.0, 1.0)
+        fill_strength_spin.setSingleStep(0.01)
+        fill_strength_spin.setDecimals(2)
+        fill_strength_spin.setValue(fill_strength.value() / 100)
+        fill_strength_spin.setFixedWidth(60)
         fill_strength.valueChanged.connect(
-            lambda v: fill_strength_label.setText(f"{v / 100:.2f}")
+            lambda v: fill_strength_spin.setValue(v / 100)
+        )
+        fill_strength_spin.valueChanged.connect(
+            lambda v: fill_strength.setValue(int(v * 100))
         )
         strength_layout.addWidget(fill_strength)
-        strength_layout.addWidget(fill_strength_label)
+        strength_layout.addWidget(fill_strength_spin)
         strength_row.setToolTip(
             "How much the selection content influences the result.\n"
             "0.0 = ignore existing content entirely.\n"
@@ -1321,11 +1342,16 @@ class KritaiDocker(DockWidget):
         softness = QSlider(Qt.Horizontal)
         softness.setRange(0, 100)
         softness.setValue(saved.get("softness", 0))
-        softness_value_label = QLabel(f"{softness.value() / 100:.2f}")
-        softness_value_label.setFixedWidth(30)
-        softness.valueChanged.connect(lambda v: softness_value_label.setText(f"{v / 100:.2f}"))
+        softness_spin = QDoubleSpinBox()
+        softness_spin.setRange(0.0, 1.0)
+        softness_spin.setSingleStep(0.01)
+        softness_spin.setDecimals(2)
+        softness_spin.setValue(softness.value() / 100)
+        softness_spin.setFixedWidth(60)
+        softness.valueChanged.connect(lambda v: softness_spin.setValue(v / 100))
+        softness_spin.valueChanged.connect(lambda v: softness.setValue(int(v * 100)))
         softness_layout.addWidget(softness)
-        softness_layout.addWidget(softness_value_label)
+        softness_layout.addWidget(softness_spin)
         softness_row.setToolTip("0.0 = off, 1.0 = maximum softness.")
         upscale_form.addRow("Softness", softness_row)
 
