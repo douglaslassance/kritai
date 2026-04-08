@@ -144,10 +144,13 @@ class DropThumbnail(QLabel):
         if path and os.path.isfile(path):
             pix = QPixmap(path)
             if not pix.isNull():
-                self.setPixmap(pix.scaled(
-                    self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-                ))
-                self.setStyleSheet("border: 1px solid #666;")
+                scaled = pix.scaled(
+                    self.size(), Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation
+                )
+                x = (scaled.width() - self.width()) // 2
+                y = (scaled.height() - self.height()) // 2
+                self.setPixmap(scaled.copy(x, y, self.width(), self.height()))
+                self.setStyleSheet("border: 2px solid #666;")
                 self.pathChanged.emit(path)
                 return
         self._apply_placeholder()
@@ -176,7 +179,7 @@ class DropThumbnail(QLabel):
         if not self._path:
             self._apply_placeholder()
         else:
-            self.setStyleSheet("border: 1px solid #666;")
+            self.setStyleSheet("border: 2px solid #666;")
 
     def dropEvent(self, event: QEvent) -> None:
         for url in event.mimeData().urls():
