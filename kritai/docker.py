@@ -362,8 +362,8 @@ class KritaiDocker(DockWidget):
         scroll.setWidget(root)
 
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(8)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(6)
 
         # --- Model selector ---
         self._model = QComboBox()
@@ -415,11 +415,6 @@ class KritaiDocker(DockWidget):
         self._prompt.setFixedHeight(60)
         outer.addWidget(self._prompt)
 
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Model"))
-        model_row.addWidget(self._model, 1)
-        outer.addLayout(model_row)
-
         # --- Negative prompt ---
         self._negative_prompt = QLineEdit()
         self._negative_prompt.setPlaceholderText("Optional negative prompt…")
@@ -435,8 +430,11 @@ class KritaiDocker(DockWidget):
         form = QFormLayout(settings_widget)
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(4)
-        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setHorizontalSpacing(20)
         outer.addWidget(settings_widget)
+
+        form.addRow("Model", self._model)
 
         self._quantize = QSpinBox()
         self._quantize.setSpecialValueText("None")
@@ -521,15 +519,9 @@ class KritaiDocker(DockWidget):
         self._scale_spin.valueChanged.connect(
             lambda v: self._scale.setValue(int(v * 100))
         )
-        self._scale_input = QCheckBox("Input")
-        self._scale_input.setToolTip(
-            "When checked, the input image is pre-scaled before sending to mflux\n"
-            "instead of passing --width/--height to the command.\n"
-            "Required for edit models that don't accept width/height arguments."
-        )
+
         scale_layout.addWidget(self._scale)
         scale_layout.addWidget(self._scale_spin)
-        scale_layout.addWidget(self._scale_input)
         scale_row.setToolTip(
             "Scale of the canvas sent to mflux relative to its original size.\n"
             "0.5 = half resolution (faster, less VRAM).\n"
@@ -718,7 +710,6 @@ class KritaiDocker(DockWidget):
             self._scale.valueChanged,
             self._seed.valueChanged,
             self._random_seed.toggled,
-            self._scale_input.toggled,
         ]:
             signal.connect(self._save_settings)
 
@@ -738,7 +729,6 @@ class KritaiDocker(DockWidget):
             self._scale.valueChanged,
             self._seed.valueChanged,
             self._random_seed.toggled,
-            self._scale_input.toggled,
         ]:
             signal.connect(self._on_setting_changed)
 
@@ -765,7 +755,6 @@ class KritaiDocker(DockWidget):
             "guidance": self._guidance.value(),
             "strength": self._strength.value() / 100,
             "scale": self._scale.value() / 100,
-            "scale_input": self._scale_input.isChecked(),
             "seed": self._seed.value(),
             "random_seed": self._random_seed.isChecked(),
             "loras": [
@@ -831,7 +820,7 @@ class KritaiDocker(DockWidget):
         widgets = [
             self._prompt, self._negative_prompt, self._model,
             self._quantize, self._steps, self._guidance,
-            self._strength, self._scale, self._scale_input, self._seed, self._random_seed,
+            self._strength, self._scale, self._seed, self._random_seed,
         ]
         for w in widgets:
             w.blockSignals(True)
@@ -861,7 +850,6 @@ class KritaiDocker(DockWidget):
         scale_val = int(data.get("scale", data.get("downscale", data.get("resolution_scale", 0.5))) * 100)
         self._scale.setValue(scale_val)
         self._scale_spin.setValue(scale_val / 100)
-        self._scale_input.setChecked(data.get("scale_input", False))
         self._seed.setValue(data.get("seed", 0))
         self._random_seed.setChecked(data.get("random_seed", False))
 
@@ -1025,9 +1013,8 @@ class KritaiDocker(DockWidget):
         )
         needs_reference = rest[0] if rest else False
 
-        # Pre-scale the input image when the checkbox is on (or for edit models
-        # that don't accept --width/--height arguments).
-        scale_input = self._scale_input.isChecked() or needs_reference
+        # Pre-scale the input image for edit models that don't accept --width/--height arguments.
+        scale_input = needs_reference
         if scale_input and abs(scale - 1.0) >= 0.001:
             img = QImage(self._tmp_input)
             if not img.isNull():
@@ -1554,7 +1541,10 @@ class KritaiDocker(DockWidget):
             thread.start()
 
         buttons.accepted.connect(on_import)
-        buttons.rejected.connect(dlg.reject)
+        buttons.rejected.connect(lambda: (
+            dlg._thread.terminate() if hasattr(dlg, '_thread') and dlg._thread.isRunning() else None,
+            dlg.reject()
+        ))
 
         dlg.exec_()
 
