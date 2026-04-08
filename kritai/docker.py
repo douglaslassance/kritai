@@ -699,8 +699,8 @@ class KritaiDocker(DockWidget):
             "prompt": self._prompt.toPlainText(),
             "negative_prompt": self._negative_prompt.text(),
             "reference_images": [
-                {"path": t.imagePath() or "", "prompt": p.text().strip()}
-                for t, p, _ in self._ref_entries
+                {"path": t.imagePath() or "", "prompt": p.text().strip(), "enabled": e.isChecked()}
+                for e, t, p, _ in self._ref_entries
                 if (t.imagePath() or "").strip() or p.text().strip()
             ],
             "model": self._model.currentText(),
@@ -712,8 +712,8 @@ class KritaiDocker(DockWidget):
             "seed": self._seed.value(),
             "random_seed": self._random_seed.isChecked(),
             "loras": [
-                {"path": p.text().strip(), "scale": s.value()}
-                for p, s, _ in self._lora_entries if p.text().strip()
+                {"path": p.text().strip(), "scale": s.value(), "enabled": e.isChecked()}
+                for e, p, s, _ in self._lora_entries if p.text().strip()
             ],
             "upscale": self._upscale_settings.get(uid, {}),
         }
@@ -763,15 +763,15 @@ class KritaiDocker(DockWidget):
         self._prompt.setPlainText(data.get("prompt", ""))
         self._negative_prompt.setText(data.get("negative_prompt", ""))
         # Restore reference images.
-        for _, _, row in list(self._ref_entries):
+        for *_, row in list(self._ref_entries):
             self._ref_list.removeWidget(row)
             row.deleteLater()
         self._ref_entries.clear()
         for ref in data.get("reference_images", []):
-            self._add_ref_row(ref.get("path", ""), ref.get("prompt", ""))
+            self._add_ref_row(ref.get("path", ""), ref.get("prompt", ""), ref.get("enabled", True))
         # Backward compat: migrate old single reference_image field.
         if not data.get("reference_images") and data.get("reference_image"):
-            self._add_ref_row(data["reference_image"], "")
+            self._add_ref_row(data["reference_image"], "", True)
         model = data.get("model", "dev")
         idx = self._model.findText(model)
         if idx >= 0:
@@ -790,12 +790,12 @@ class KritaiDocker(DockWidget):
 
         # Restore LoRAs.
         # Clear existing rows.
-        for _, _, row in list(self._lora_entries):
+        for *_, row in list(self._lora_entries):
             self._lora_list.removeWidget(row)
             row.deleteLater()
         self._lora_entries.clear()
         for lora in data.get("loras", []):
-            self._add_lora_row(lora.get("path", ""), lora.get("scale", 1.0))
+            self._add_lora_row(lora.get("path", ""), lora.get("scale", 1.0), lora.get("enabled", True))
 
         # Restore upscale settings.
         upscale = data.get("upscale")
@@ -943,7 +943,9 @@ class KritaiDocker(DockWidget):
 
         if needs_reference:
             cmd += ["--image-paths", self._tmp_input]
-            for thumb, _, _ in self._ref_entries:
+            for enabled_cb, thumb, _, _ in self._ref_entries:
+                if not enabled_cb.isChecked():
+                    continue
                 ref_path = (thumb.imagePath() or "").strip()
                 if ref_path:
                     cmd.append(ref_path)
@@ -1486,14 +1488,18 @@ class KritaiDocker(DockWidget):
 
         self._ref_section.setVisible(needs_ref)
 
-    def _add_lora_row(self, path: str = "", scale: float = 1.0) -> None:
-        """Add a LoRA entry row with path, scale, and remove button."""
+    def _add_lora_row(self, path: str = "", scale: float = 1.0, enabled: bool = True) -> None:
+        """Add a LoRA entry row with enable checkbox, path, scale, and remove button."""
         from PyQt5.QtWidgets import QFileDialog
 
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(4)
+
+        enabled_cb = QCheckBox()
+        enabled_cb.setChecked(enabled)
+        enabled_cb.setToolTip("Enable/disable this LoRA")
 
         path_edit = QLineEdit()
         path_edit.setPlaceholderText("LoRA path or HuggingFace repo...")
@@ -1505,7 +1511,7 @@ class KritaiDocker(DockWidget):
 
         browse_btn = QPushButton("…")
         browse_btn.setFixedWidth(28)
-        def browse(checked=False, pe=path_edit):
+        def browse(checked: bool = False, pe: QLineEdit = path_edit) -> None:
             p, _ = QFileDialog.getOpenFileName(
                 self, "Select LoRA file", "",
                 "LoRA files (*.safetensors *.bin);;All files (*)"
@@ -1523,21 +1529,20 @@ class KritaiDocker(DockWidget):
 
         remove_btn = QPushButton("×")
         remove_btn.setFixedWidth(22)
-        def remove(checked=False, r=row):
-            self._remove_lora_row(r)
-        remove_btn.clicked.connect(remove)
+        remove_btn.clicked.connect(lambda checked=False, r=row: self._remove_lora_row(r))
 
+        row_layout.addWidget(enabled_cb)
         row_layout.addWidget(path_edit, 1)
         row_layout.addWidget(browse_btn)
         row_layout.addWidget(scale_spin)
         row_layout.addWidget(remove_btn)
 
         self._lora_list.addWidget(row)
-        self._lora_entries.append((path_edit, scale_spin, row))
+        self._lora_entries.append((enabled_cb, path_edit, scale_spin, row))
 
     def _remove_lora_row(self, row: QWidget) -> None:
         self._lora_entries = [
-            (p, s, r) for p, s, r in self._lora_entries if r is not row
+            e for e in self._lora_entries if e[-1] is not row
         ]
         self._lora_list.removeWidget(row)
         row.deleteLater()
@@ -1546,7 +1551,9 @@ class KritaiDocker(DockWidget):
         """Return the --lora-paths and --lora-scales command fragments."""
         paths = []
         scales = []
-        for path_edit, scale_spin, _ in self._lora_entries:
+        for enabled_cb, path_edit, scale_spin, _ in self._lora_entries:
+            if not enabled_cb.isChecked():
+                continue
             p = path_edit.text().strip()
             if p:
                 paths.append(p)
@@ -1555,12 +1562,16 @@ class KritaiDocker(DockWidget):
             return []
         return ["--lora-paths"] + paths + ["--lora-scales"] + scales
 
-    def _add_ref_row(self, path: str = "", prompt: str = "") -> None:
-        """Add a reference image entry with thumbnail, prompt, and remove button."""
+    def _add_ref_row(self, path: str = "", prompt: str = "", enabled: bool = True) -> None:
+        """Add a reference image entry with enable checkbox, thumbnail, prompt, and remove button."""
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
         row_layout.setSpacing(4)
+
+        enabled_cb = QCheckBox()
+        enabled_cb.setChecked(enabled)
+        enabled_cb.setToolTip("Enable/disable this reference image")
 
         thumb = DropThumbnail()
         if path:
@@ -1574,16 +1585,17 @@ class KritaiDocker(DockWidget):
         remove_btn.setFixedWidth(22)
         remove_btn.clicked.connect(lambda checked=False, r=row: self._remove_ref_row(r))
 
+        row_layout.addWidget(enabled_cb)
         row_layout.addWidget(thumb)
         row_layout.addWidget(prompt_edit, 1)
         row_layout.addWidget(remove_btn)
 
         self._ref_list.addWidget(row)
-        self._ref_entries.append((thumb, prompt_edit, row))
+        self._ref_entries.append((enabled_cb, thumb, prompt_edit, row))
 
     def _remove_ref_row(self, row: QWidget) -> None:
         self._ref_entries = [
-            (t, p, r) for t, p, r in self._ref_entries if r is not row
+            e for e in self._ref_entries if e[-1] is not row
         ]
         self._ref_list.removeWidget(row)
         row.deleteLater()
@@ -1594,11 +1606,15 @@ class KritaiDocker(DockWidget):
         if not main:
             return ""
         parts = [main]
-        for i, (thumb, prompt_edit, _) in enumerate(self._ref_entries, 1):
+        idx = 0
+        for enabled_cb, thumb, prompt_edit, _ in self._ref_entries:
+            if not enabled_cb.isChecked():
+                continue
             ref_path = (thumb.imagePath() or "").strip()
             ref_prompt = prompt_edit.text().strip()
             if ref_path and ref_prompt:
-                parts.append(f"Reference image {i}: {ref_prompt}")
+                idx += 1
+                parts.append(f"Reference image {idx}: {ref_prompt}")
         return "\n".join(parts)
 
     def _update_preview_ratio(self, doc: object) -> None:
