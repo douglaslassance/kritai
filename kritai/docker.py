@@ -577,6 +577,8 @@ class KritaiDocker(DockWidget):
         self._generate_btn = QPushButton("Generate")
         self._generate_btn.clicked.connect(self._generate)
         self._generate_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._generate_btn.setEnabled(False)
+        self._generate_btn.setToolTip("No active document.")
         btn_row.addWidget(self._generate_btn)
         btn_row.addWidget(self._auto_btn)
 
@@ -658,6 +660,7 @@ class KritaiDocker(DockWidget):
         outer.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
         self._update_model_ui()
+        self._prompt.textChanged.connect(self._update_generate_btn)
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -858,6 +861,20 @@ class KritaiDocker(DockWidget):
         except Exception:
             return None
 
+    def _update_generate_btn(self) -> None:
+        """Enable/disable generate button based on document and prompt state."""
+        if not self._current_doc:
+            self._generate_btn.setEnabled(False)
+            self._generate_btn.setToolTip("No active document.")
+            return
+        prompt = self._build_prompt()
+        if not prompt:
+            self._generate_btn.setEnabled(False)
+            self._generate_btn.setToolTip("Enter a prompt to generate.")
+            return
+        self._generate_btn.setEnabled(True)
+        self._generate_btn.setToolTip("Generate an image from the current canvas and prompt.")
+
     def _poll_selection(self) -> None:
         """Enable/disable fill button based on whether a selection is active."""
         has_sel = False
@@ -901,14 +918,10 @@ class KritaiDocker(DockWidget):
         app = Krita.instance()
         doc = app.activeDocument()
         if not doc:
-            self._set_status("No active document.")
-            return
-
-        raw_prompt = self._prompt.toPlainText().strip()
-        if not raw_prompt:
-            self._set_status("Enter a prompt first.")
             return
         prompt = self._build_prompt()
+        if not prompt:
+            return
 
         if self._thread and self._thread.isRunning():
             self._thread.terminate()
@@ -1667,6 +1680,7 @@ class KritaiDocker(DockWidget):
         else:
             self._preview.setVisible(False)
             self._use_btn.setEnabled(False)
+        self._update_generate_btn()
 
 
 def _export_selection_crop(doc: object, path: str) -> Optional[tuple[int, int, int, int]]:
