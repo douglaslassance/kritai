@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import os
@@ -5,12 +7,20 @@ import re
 import subprocess
 import tempfile
 import threading
+from typing import Optional
 
 from krita import DockWidget, InfoObject
-from PyQt5.QtCore import QByteArray
-from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
-from PyQt5.QtCore import QEvent, QObject, QSize
-from PyQt5.QtGui import QIcon, QImage, QPixmap
+from PyQt5.QtCore import (
+    QByteArray,
+    QEvent,
+    QObject,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
+from PyQt5.QtGui import QFontDatabase, QImage, QPixmap
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +28,7 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGraphicsOpacityEffect,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -25,21 +36,20 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSpacerItem,
-    QToolButton,
-    QSizePolicy,
     QSpinBox,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
 MFLUX_DIR = os.path.expanduser("~/.local/bin")
 
-# Maps model name → (cli_binary, model_flag_or_None, supports_strength, supports_guidance, needs_reference_image)
-# Distilled models (klein, turbo, schnell) don't accept a variable guidance scale.
-# Each model family has its own CLI; FLUX.2 and FIBO share a CLI across variants.
-# Models with needs_reference_image=True use --image-paths [canvas, ref] instead of --image-path canvas.
+# Maps model name → (cli_binary, model_flag, supports_strength, supports_guidance, needs_reference_image).
+# Distilled models (klein, schnell) don't accept a variable guidance scale.
+# Models with needs_reference_image=True use --image-paths [canvas, ref…] instead of --image-path canvas.
 MODEL_CLI = {
     # FLUX.2 — distilled variants: no guidance; base variants: guidance ok
     "flux2-klein-4b":      ("mflux-generate-flux2",      "flux2-klein-4b",      True,  False, False),
@@ -47,11 +57,7 @@ MODEL_CLI = {
     "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True,  False),
     "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
     # FLUX.2 edit — canvas + optional reference image via --image-paths
-    "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, True,  True),
-    # Qwen
-    "qwen":                ("mflux-generate-qwen",        None,                 True,  True,  False),
-    # Qwen edit — canvas + optional reference image via --image-paths
-    "qwen-edit":           ("mflux-generate-qwen-edit",   None,                 False, True,  True),
+    "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, False, True),
     # Kontext (image editing via instruction)
     "kontext-dev":         ("mflux-generate-kontext",     "dev",                True,  True,  False),
     "kontext-schnell":     ("mflux-generate-kontext",     "schnell",            True,  False, False),
@@ -66,40 +72,40 @@ DEBOUNCE_MS = 2000
 class PreviewLabel(QLabel):
     """QLabel that paints its pixmap centered with correct aspect ratio."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self._ratio = 1.0
-        self._source = None
+        self._ratio: float = 1.0
+        self._source: Optional[QPixmap] = None
 
-    def setRatio(self, ratio):
+    def setRatio(self, ratio: float) -> None:
         if ratio > 0 and ratio != self._ratio:
             self._ratio = ratio
             self._update_fixed_height()
 
-    def resizeEvent(self, event):
+    def resizeEvent(self, event: QEvent) -> None:
         super().resizeEvent(event)
         self._update_fixed_height()
 
-    def _update_fixed_height(self):
+    def _update_fixed_height(self) -> None:
         self.setFixedHeight(max(1, self.heightForWidth(self.width())))
 
-    def setPixmap(self, pixmap):
+    def setPixmap(self, pixmap: QPixmap) -> None:
         self._source = pixmap
         self.update()
 
-    def hasHeightForWidth(self):
+    def hasHeightForWidth(self) -> bool:
         return True
 
-    def heightForWidth(self, width):
+    def heightForWidth(self, width: int) -> int:
         return int(width * self._ratio)
 
-    def sizeHint(self):
+    def sizeHint(self) -> QSize:
         return QSize(1, self.heightForWidth(1))
 
-    def minimumSizeHint(self):
+    def minimumSizeHint(self) -> QSize:
         return QSize(1, 1)
 
-    def paintEvent(self, event):
+    def paintEvent(self, event: QEvent) -> None:
         from PyQt5.QtGui import QPainter
         painter = QPainter(self)
         if self._source:
@@ -109,10 +115,81 @@ class PreviewLabel(QLabel):
             painter.drawPixmap(x, y, scaled)
 
 
+class DropThumbnail(QLabel):
+    """64x64 label that accepts image drops and clicks to browse."""
+
+    pathChanged = pyqtSignal(str)
+
+    _IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".tiff")
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._path: str = ""
+        self.setFixedSize(64, 64)
+        self.setAlignment(Qt.AlignCenter)
+        self.setAcceptDrops(True)
+        self._apply_placeholder()
+
+    def _apply_placeholder(self) -> None:
+        self.setText("+")
+        self.setStyleSheet(
+            "border: 2px dashed #888; background: #333; color: #aaa; font-size: 24px;"
+        )
+
+    def imagePath(self) -> str:
+        return self._path
+
+    def setImagePath(self, path: str) -> None:
+        self._path = path
+        if path and os.path.isfile(path):
+            pix = QPixmap(path)
+            if not pix.isNull():
+                self.setPixmap(pix.scaled(
+                    self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                ))
+                self.setStyleSheet("border: 1px solid #666;")
+                self.pathChanged.emit(path)
+                return
+        self._apply_placeholder()
+        self.pathChanged.emit(path)
+
+    def mousePressEvent(self, event: QEvent) -> None:
+        from PyQt5.QtWidgets import QFileDialog
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select reference image", "",
+            "Images (*.png *.jpg *.jpeg *.webp *.tiff)"
+        )
+        if path:
+            self.setImagePath(path)
+
+    def dragEnterEvent(self, event: QEvent) -> None:
+        if event.mimeData().hasUrls():
+            for url in event.mimeData().urls():
+                if any(url.toLocalFile().lower().endswith(e) for e in self._IMAGE_EXTS):
+                    event.acceptProposedAction()
+                    self.setStyleSheet(
+                        "border: 2px solid #4a9; background: #333; color: #aaa; font-size: 24px;"
+                    )
+                    return
+
+    def dragLeaveEvent(self, event: QEvent) -> None:
+        if not self._path:
+            self._apply_placeholder()
+        else:
+            self.setStyleSheet("border: 1px solid #666;")
+
+    def dropEvent(self, event: QEvent) -> None:
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if any(path.lower().endswith(e) for e in self._IMAGE_EXTS):
+                self.setImagePath(path)
+                return
+
+
 class CollapsibleSection(QWidget):
     """A full-width accordion-style collapsible section."""
 
-    def __init__(self, title, parent=None):
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self._title = title
 
@@ -139,19 +216,19 @@ class CollapsibleSection(QWidget):
         self._content.setVisible(False)
         outer.addWidget(self._content)
 
-    def addHeaderWidget(self, widget):
+    def addHeaderWidget(self, widget: QWidget) -> None:
         """Add a widget to the right side of the header (e.g. a Clear button)."""
         widget.setVisible(False)
         self._toggle.toggled.connect(widget.setVisible)
         self._header_row.addWidget(widget)
 
-    def setContentLayout(self, layout):
+    def setContentLayout(self, layout: QVBoxLayout) -> None:
         self._content.setLayout(layout)
 
-    def setExpanded(self, expanded):
+    def setExpanded(self, expanded: bool) -> None:
         self._toggle.setChecked(expanded)
 
-    def _on_toggled(self, checked):
+    def _on_toggled(self, checked: bool) -> None:
         self._content.setVisible(checked)
         self._toggle.setText(("▼" if checked else "▶") + f"  {self._title}")
 
@@ -162,12 +239,12 @@ class GenerateThread(QThread):
     logged = pyqtSignal(str)          # line of stdout/stderr for the log panel
     progress = pyqtSignal(int)        # 0–100
 
-    def __init__(self, cmd, output_path):
+    def __init__(self, cmd: list[str], output_path: str) -> None:
         super().__init__()
         self.cmd = cmd
         self.output_path = output_path
 
-    def run(self):
+    def run(self) -> None:
         try:
             # Strip Krita's Python environment variables so they don't bleed
             # into the mflux subprocess (causes SRE module mismatch otherwise).
@@ -216,11 +293,11 @@ class _FocusOutSignal(QObject):
     """Emits focusLost when the watched widget loses focus."""
     focusLost = pyqtSignal()
 
-    def __init__(self, widget):
+    def __init__(self, widget: QWidget) -> None:
         super().__init__(widget)
         widget.installEventFilter(self)
 
-    def eventFilter(self, obj, event):
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
         if event.type() == QEvent.FocusOut:
             self.focusLost.emit()
         return False
@@ -228,17 +305,17 @@ class _FocusOutSignal(QObject):
 
 class KritaiDocker(DockWidget):
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Kritai")
-        self._thread = None
-        self._tmp_input = None
-        self._tmp_output = None
-        self._last_canvas_hash = None
-        self._current_doc = None
-        self._doc_previews = {}    # uid → QPixmap, session only
-        self._doc_settings = {}    # uid → settings dict, session only
-        self._upscale_settings = {}  # uid → upscale options dict, session only
+        self._thread: Optional[GenerateThread] = None
+        self._tmp_input: Optional[str] = None
+        self._tmp_output: Optional[str] = None
+        self._last_canvas_hash: Optional[str] = None
+        self._current_doc = None  # krita.Document
+        self._doc_previews: dict[str, QPixmap] = {}
+        self._doc_settings: dict[str, dict] = {}
+        self._upscale_settings: dict[str, dict] = {}
 
         # Flush settings to annotation only when Krita saves the file.
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
@@ -261,7 +338,7 @@ class KritaiDocker(DockWidget):
     # UI
     # ------------------------------------------------------------------
 
-    def _build_ui(self):
+    def _build_ui(self) -> None:
         root = QWidget()
         self.setWidget(root)
 
@@ -280,8 +357,6 @@ class KritaiDocker(DockWidget):
             "flux2-klein-base-4b": "Non-distilled 4B base model. Supports guidance. Needs more steps.",
             "flux2-klein-base-9b": "Non-distilled 9B base model. Best quality in the FLUX.2 family.",
             "flux2-edit":          "Edit the canvas with a prompt and an optional reference image.",
-            "qwen":                "Qwen-based generation. Supports guidance.",
-            "qwen-edit":           "Instruction-based canvas editing with an optional reference image.",
             "kontext-dev":         "High-quality instruction-based image editing.",
             "kontext-schnell":     "Faster distilled variant. No guidance.",
         }
@@ -292,10 +367,6 @@ class KritaiDocker(DockWidget):
                 "flux2-klein-base-4b",
                 "flux2-klein-base-9b",
                 "flux2-edit",
-            ],
-            "Qwen": [
-                "qwen",
-                "qwen-edit",
             ],
             "Kontext": [
                 "kontext-dev",
@@ -315,7 +386,7 @@ class KritaiDocker(DockWidget):
         self._model.setToolTip(
             "Which mflux model family to use for generation.\n"
             "FLUX.2 is the fastest and highest quality.\n"
-            "Qwen and Kontext offer instruction-based editing."
+            "Kontext offers instruction-based editing."
         )
         self._model.currentIndexChanged.connect(self._update_model_ui)
         model_row = QHBoxLayout()
@@ -346,7 +417,6 @@ class KritaiDocker(DockWidget):
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(4)
         outer.addWidget(settings_widget)
-
 
         self._quantize = QSpinBox()
         self._quantize.setSpecialValueText("None")
@@ -405,25 +475,6 @@ class KritaiDocker(DockWidget):
         self._strength_row = strength_row
         self._strength_label_form = form.labelForField(strength_row)
 
-        ref_row = QWidget()
-        ref_layout = QHBoxLayout(ref_row)
-        ref_layout.setContentsMargins(0, 0, 0, 0)
-        ref_layout.setSpacing(4)
-        self._ref_image = QLineEdit()
-        self._ref_image.setPlaceholderText("Optional reference image…")
-        self._ref_image.setToolTip(
-            "Optional second image passed alongside the canvas to the model.\n"
-            "Leave empty to use the canvas alone."
-        )
-        ref_browse = QPushButton("…")
-        ref_browse.setFixedWidth(28)
-        ref_browse.clicked.connect(self._browse_reference_image)
-        ref_layout.addWidget(self._ref_image)
-        ref_layout.addWidget(ref_browse)
-        form.addRow("Reference", ref_row)
-        self._ref_row = ref_row
-        self._ref_label = form.labelForField(ref_row)
-
         scale_row = QWidget()
         scale_layout = QHBoxLayout(scale_row)
         scale_layout.setContentsMargins(0, 0, 0, 0)
@@ -463,6 +514,40 @@ class KritaiDocker(DockWidget):
         )
         form.addRow("Seed", seed_row)
 
+        # --- Reference images (edit models only) ---
+        self._ref_section = CollapsibleSection("Reference Images")
+        ref_content = QVBoxLayout()
+        ref_content.setSpacing(4)
+
+        self._ref_list = QVBoxLayout()
+        self._ref_list.setSpacing(4)
+        ref_content.addLayout(self._ref_list)
+        self._ref_entries = []  # list of (thumbnail, prompt_edit, row_widget)
+
+        add_ref_btn = QPushButton("+ Add Reference")
+        add_ref_btn.clicked.connect(lambda: self._add_ref_row())
+        ref_content.addWidget(add_ref_btn)
+
+        self._ref_section.setContentLayout(ref_content)
+        self._ref_section.setVisible(False)
+        outer.addWidget(self._ref_section)
+
+        # --- LoRA list ---
+        lora_section = CollapsibleSection("LoRAs")
+        lora_content = QVBoxLayout()
+        lora_content.setSpacing(4)
+
+        self._lora_list = QVBoxLayout()
+        self._lora_list.setSpacing(4)
+        lora_content.addLayout(self._lora_list)
+        self._lora_entries = []  # list of (path_widget, scale_widget, row_widget)
+
+        add_lora_btn = QPushButton("+ Add LoRA")
+        add_lora_btn.clicked.connect(lambda: self._add_lora_row())
+        lora_content.addWidget(add_lora_btn)
+
+        lora_section.setContentLayout(lora_content)
+        outer.addWidget(lora_section)
 
         # --- Buttons ---
         btn_row = QHBoxLayout()
@@ -487,7 +572,6 @@ class KritaiDocker(DockWidget):
         self._fill_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._fill_btn.setEnabled(False)
         self._fill_btn.clicked.connect(self._fill_selection)
-        from PyQt5.QtWidgets import QGraphicsOpacityEffect
         self._fill_opacity = QGraphicsOpacityEffect(self._fill_btn)
         self._fill_opacity.setOpacity(0.3)
         self._fill_btn.setGraphicsEffect(self._fill_opacity)
@@ -535,21 +619,12 @@ class KritaiDocker(DockWidget):
         progress_row.addWidget(self._cancel_btn)
         outer.addLayout(progress_row)
 
-        # --- Preview image ---
-        self._preview = PreviewLabel()
-        self._preview.setAlignment(Qt.AlignCenter)
-        self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        self._preview.setStyleSheet("border-radius: 4px;")
-        self._preview.setVisible(False)
-        outer.addWidget(self._preview)
-
         # --- Log section ---
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMinimumHeight(120)
         self._log.setMaximumHeight(240)
         self._log.setVisible(False)
-        from PyQt5.QtGui import QFontDatabase
         self._log.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
 
         self._clear_btn = QPushButton("Clear")
@@ -558,6 +633,14 @@ class KritaiDocker(DockWidget):
 
         outer.addWidget(self._log)
         outer.addWidget(self._clear_btn)
+
+        # --- Preview image ---
+        self._preview = PreviewLabel()
+        self._preview.setAlignment(Qt.AlignCenter)
+        self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._preview.setStyleSheet("border-radius: 4px;")
+        self._preview.setVisible(False)
+        outer.addWidget(self._preview)
         outer.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
         self._update_model_ui()
@@ -568,12 +651,11 @@ class KritaiDocker(DockWidget):
 
     ANNOTATION_TYPE = "kritai_settings"
 
-    def _connect_settings_signals(self):
+    def _connect_settings_signals(self) -> None:
         # All changes persist settings immediately.
         for signal in [
             self._prompt.textChanged,
             self._negative_prompt.textChanged,
-            self._ref_image.textChanged,
             self._model.currentIndexChanged,
             self._quantize.valueChanged,
             self._steps.valueChanged,
@@ -588,7 +670,6 @@ class KritaiDocker(DockWidget):
         # Auto-refresh triggers only on focus-out for text fields,
         # immediately for all other controls.
         self._negative_prompt.editingFinished.connect(self._on_setting_changed)
-        self._ref_image.editingFinished.connect(self._on_setting_changed)
 
         prompt_filter = _FocusOutSignal(self._prompt)
         prompt_filter.focusLost.connect(self._on_setting_changed)
@@ -605,11 +686,11 @@ class KritaiDocker(DockWidget):
         ]:
             signal.connect(self._on_setting_changed)
 
-    def _on_setting_changed(self):
+    def _on_setting_changed(self) -> None:
         if self._auto_btn.isChecked():
             self._debounce_timer.start()
 
-    def _save_settings(self):
+    def _save_settings(self) -> None:
         doc = self._current_doc
         if not doc:
             return
@@ -617,7 +698,11 @@ class KritaiDocker(DockWidget):
         new = {
             "prompt": self._prompt.toPlainText(),
             "negative_prompt": self._negative_prompt.text(),
-            "reference_image": self._ref_image.text(),
+            "reference_images": [
+                {"path": t.imagePath() or "", "prompt": p.text().strip()}
+                for t, p, _ in self._ref_entries
+                if (t.imagePath() or "").strip() or p.text().strip()
+            ],
             "model": self._model.currentText(),
             "quantize": self._quantize.value(),
             "steps": self._steps.value(),
@@ -626,6 +711,10 @@ class KritaiDocker(DockWidget):
             "scale": self._scale.value() / 100,
             "seed": self._seed.value(),
             "random_seed": self._random_seed.isChecked(),
+            "loras": [
+                {"path": p.text().strip(), "scale": s.value()}
+                for p, s, _ in self._lora_entries if p.text().strip()
+            ],
             "upscale": self._upscale_settings.get(uid, {}),
         }
         prev = self._doc_settings.get(uid)
@@ -633,7 +722,7 @@ class KritaiDocker(DockWidget):
         if prev != new:
             doc.setModified(True)
 
-    def _on_image_saved(self, filename):
+    def _on_image_saved(self, filename: str) -> None:
         """Flush in-memory settings to the document annotation on save."""
         for doc in Krita.instance().documents():
             if doc.fileName() == filename:
@@ -646,7 +735,7 @@ class KritaiDocker(DockWidget):
                     doc.setModified(False)
                 break
 
-    def _load_settings(self, doc):
+    def _load_settings(self, doc: object) -> None:
         uid = doc.fileName() or str(id(doc))
         if uid in self._doc_settings:
             data = self._doc_settings[uid]
@@ -664,7 +753,7 @@ class KritaiDocker(DockWidget):
         # Block signals while restoring to avoid triggering _save_settings
         # for each individual widget change.
         widgets = [
-            self._prompt, self._negative_prompt, self._ref_image, self._model,
+            self._prompt, self._negative_prompt, self._model,
             self._quantize, self._steps, self._guidance,
             self._strength, self._scale, self._seed, self._random_seed,
         ]
@@ -673,7 +762,16 @@ class KritaiDocker(DockWidget):
 
         self._prompt.setPlainText(data.get("prompt", ""))
         self._negative_prompt.setText(data.get("negative_prompt", ""))
-        self._ref_image.setText(data.get("reference_image", ""))
+        # Restore reference images.
+        for _, _, row in list(self._ref_entries):
+            self._ref_list.removeWidget(row)
+            row.deleteLater()
+        self._ref_entries.clear()
+        for ref in data.get("reference_images", []):
+            self._add_ref_row(ref.get("path", ""), ref.get("prompt", ""))
+        # Backward compat: migrate old single reference_image field.
+        if not data.get("reference_images") and data.get("reference_image"):
+            self._add_ref_row(data["reference_image"], "")
         model = data.get("model", "dev")
         idx = self._model.findText(model)
         if idx >= 0:
@@ -690,6 +788,15 @@ class KritaiDocker(DockWidget):
         self._seed.setValue(data.get("seed", 0))
         self._random_seed.setChecked(data.get("random_seed", False))
 
+        # Restore LoRAs.
+        # Clear existing rows.
+        for _, _, row in list(self._lora_entries):
+            self._lora_list.removeWidget(row)
+            row.deleteLater()
+        self._lora_entries.clear()
+        for lora in data.get("loras", []):
+            self._add_lora_row(lora.get("path", ""), lora.get("scale", 1.0))
+
         # Restore upscale settings.
         upscale = data.get("upscale")
         if upscale:
@@ -705,7 +812,7 @@ class KritaiDocker(DockWidget):
     # Auto-mode
     # ------------------------------------------------------------------
 
-    def _on_auto_toggled(self, checked):
+    def _on_auto_toggled(self, checked: bool) -> None:
         if checked:
             self._last_canvas_hash = self._canvas_hash()
             self._poll_timer.start()
@@ -714,13 +821,13 @@ class KritaiDocker(DockWidget):
             self._poll_timer.stop()
             self._debounce_timer.stop()
 
-    def _export_canvas(self, doc, path):
+    def _export_canvas(self, doc: object, path: str) -> None:
         """Export the canvas to *path* at full resolution."""
         doc.setBatchmode(True)
         doc.exportImage(path, InfoObject())
         doc.setBatchmode(False)
 
-    def _canvas_hash(self):
+    def _canvas_hash(self) -> Optional[str]:
         """Return a hash of a small in-memory thumbnail — no disk I/O."""
         from krita import Krita
 
@@ -737,7 +844,7 @@ class KritaiDocker(DockWidget):
         except Exception:
             return None
 
-    def _poll_selection(self):
+    def _poll_selection(self) -> None:
         """Enable/disable fill button based on whether a selection is active."""
         has_sel = False
         if self._current_doc:
@@ -746,7 +853,7 @@ class KritaiDocker(DockWidget):
         self._fill_btn.setEnabled(has_sel)
         self._fill_opacity.setOpacity(1.0 if has_sel else 0.3)
 
-    def _poll_canvas(self):
+    def _poll_canvas(self) -> None:
         if self._thread and self._thread.isRunning():
             return
         current = self._canvas_hash()
@@ -758,23 +865,23 @@ class KritaiDocker(DockWidget):
     # Generation
     # ------------------------------------------------------------------
 
-    def _set_status(self, text):
+    def _set_status(self, text: str) -> None:
         self._progress.setFormat(text)
 
-    def _set_busy(self, busy):
+    def _set_busy(self, busy: bool) -> None:
         self._progress.setValue(0)
         self._progress.setVisible(busy)
         self._cancel_btn.setEnabled(busy)
         self._cancel_btn.setVisible(busy)
         self._set_status("Initializing..." if busy else "")
 
-    def _cancel(self):
+    def _cancel(self) -> None:
         if self._thread and self._thread.isRunning():
             self._thread.terminate()
             self._thread.wait()
         self._set_busy(False)
 
-    def _generate(self):
+    def _generate(self) -> None:
         from krita import Krita
 
         app = Krita.instance()
@@ -783,10 +890,11 @@ class KritaiDocker(DockWidget):
             self._set_status("No active document.")
             return
 
-        prompt = self._prompt.toPlainText().strip()
-        if not prompt:
+        raw_prompt = self._prompt.toPlainText().strip()
+        if not raw_prompt:
             self._set_status("Enter a prompt first.")
             return
+        prompt = self._build_prompt()
 
         if self._thread and self._thread.isRunning():
             self._thread.terminate()
@@ -820,6 +928,12 @@ class KritaiDocker(DockWidget):
             model_name, ("mflux-generate", model_name, True, True, False)
         )
         needs_reference = rest[0] if rest else False
+
+        # Edit models don't accept --width/--height; pre-scale the input instead.
+        if needs_reference and abs(scale - 1.0) >= 0.001:
+            img = QImage(self._tmp_input)
+            if not img.isNull():
+                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
         cli_path = os.path.join(MFLUX_DIR, cli_name)
 
         cmd = [cli_path, "--prompt", prompt]
@@ -829,9 +943,10 @@ class KritaiDocker(DockWidget):
 
         if needs_reference:
             cmd += ["--image-paths", self._tmp_input]
-            ref_path = self._ref_image.text().strip()
-            if ref_path:
-                cmd.append(ref_path)
+            for thumb, _, _ in self._ref_entries:
+                ref_path = (thumb.imagePath() or "").strip()
+                if ref_path:
+                    cmd.append(ref_path)
         else:
             cmd += ["--image-path", self._tmp_input]
 
@@ -840,7 +955,7 @@ class KritaiDocker(DockWidget):
             "--output", self._tmp_output,
         ]
 
-        if abs(scale - 1.0) >= 0.001:
+        if abs(scale - 1.0) >= 0.001 and not needs_reference:
             cmd += ["--width", str(target_w), "--height", str(target_h)]
 
         if supports_guidance:
@@ -859,6 +974,8 @@ class KritaiDocker(DockWidget):
         if not self._random_seed.isChecked():
             cmd += ["--seed", str(self._seed.value())]
 
+        cmd += self._get_lora_args()
+
         self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
         self._set_busy(True)
         self._thread = GenerateThread(cmd, self._tmp_output)
@@ -868,7 +985,7 @@ class KritaiDocker(DockWidget):
         self._thread.progress.connect(self._on_progress)
         self._thread.start()
 
-    def _on_finished(self, output_path):
+    def _on_finished(self, output_path: str) -> None:
         self._set_busy(False)
         exists = os.path.exists(output_path)
         size = os.path.getsize(output_path) if exists else 0
@@ -879,36 +996,36 @@ class KritaiDocker(DockWidget):
         self._show_preview(output_path)
         self._progress.setVisible(False)
 
-    def _on_error(self, message):
+    def _on_error(self, message: str) -> None:
         self._set_busy(False)
         self._set_status("Error — see Logs.")
         # Auto-expand the log panel on error so the user notices it.
         self._log_btn.setChecked(True)
 
-    def _on_log_message(self, text):
+    def _on_log_message(self, text: str) -> None:
         if text:
             self._log.appendPlainText(text)
             self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
             if any(kw in text for kw in ("Downloading", "Fetching", "fetching")):
                 self._set_status("Downloading…")
 
-    def _on_progress(self, value):
+    def _on_progress(self, value: int) -> None:
         self._progress.setValue(value)
         if value > 0:
             self._set_status(f"Generating… {value}%")
 
-    def _on_log_toggled(self, checked):
+    def _on_log_toggled(self, checked: bool) -> None:
         self._log.setVisible(checked)
         self._clear_btn.setVisible(checked)
 
-    def _clear_log(self):
+    def _clear_log(self) -> None:
         self._log.clear()
 
     # ------------------------------------------------------------------
     # Preview
     # ------------------------------------------------------------------
 
-    def _show_preview(self, path):
+    def _show_preview(self, path: str) -> None:
         pixmap = QPixmap(path)
         if pixmap.isNull():
             self._set_status("Could not load result image.")
@@ -920,7 +1037,7 @@ class KritaiDocker(DockWidget):
             self._doc_previews[self._current_doc.fileName() or str(id(self._current_doc))] = pixmap
 
     @staticmethod
-    def _load_fill_settings():
+    def _load_fill_settings() -> dict:
         from PyQt5.QtCore import QSettings
         s = QSettings("kritai", "fill")
         return {
@@ -934,13 +1051,13 @@ class KritaiDocker(DockWidget):
         }
 
     @staticmethod
-    def _save_fill_settings(data):
+    def _save_fill_settings(data: dict) -> None:
         from PyQt5.QtCore import QSettings
         s = QSettings("kritai", "fill")
         for k, v in data.items():
             s.setValue(k, str(v).lower() if isinstance(v, bool) else v)
 
-    def _fill_selection(self):
+    def _fill_selection(self) -> None:
         from krita import Krita
 
         doc = Krita.instance().activeDocument()
@@ -1102,6 +1219,8 @@ class KritaiDocker(DockWidget):
             if not dlg_random_seed.isChecked():
                 cmd += ["--seed", str(dlg_seed.value())]
 
+            cmd += self._get_lora_args()
+
             self._on_log_message("Running: " + " ".join(
                 f'"{t}"' if " " in t else t for t in cmd
             ))
@@ -1161,7 +1280,7 @@ class KritaiDocker(DockWidget):
         generate_btn.clicked.connect(on_generate)
         dlg.exec_()
 
-    def _import_to_layer(self):
+    def _import_to_layer(self) -> None:
         doc = self._current_doc
         if not doc:
             return
@@ -1327,7 +1446,7 @@ class KritaiDocker(DockWidget):
 
         dlg.exec_()
 
-    def _commit_to_layer(self, pixmap):
+    def _commit_to_layer(self, pixmap: QPixmap) -> None:
         doc = self._current_doc
         if not doc:
             return
@@ -1350,7 +1469,7 @@ class KritaiDocker(DockWidget):
 
     # ------------------------------------------------------------------
 
-    def _update_model_ui(self):
+    def _update_model_ui(self) -> None:
         model_name = self._model.currentText()
         _, _, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
             model_name, (None, None, True, True, False)
@@ -1365,25 +1484,128 @@ class KritaiDocker(DockWidget):
         if self._strength_label_form:
             self._strength_label_form.setVisible(supports_strength)
 
-        self._ref_row.setVisible(needs_ref)
-        if self._ref_label:
-            self._ref_label.setVisible(needs_ref)
+        self._ref_section.setVisible(needs_ref)
 
-    def _browse_reference_image(self):
+    def _add_lora_row(self, path: str = "", scale: float = 1.0) -> None:
+        """Add a LoRA entry row with path, scale, and remove button."""
         from PyQt5.QtWidgets import QFileDialog
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select reference image", "",
-            "Images (*.png *.jpg *.jpeg *.webp *.tiff)"
-        )
-        if path:
-            self._ref_image.setText(path)
 
-    def _update_preview_ratio(self, doc):
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+
+        path_edit = QLineEdit()
+        path_edit.setPlaceholderText("LoRA path or HuggingFace repo...")
+        path_edit.setText(path)
+        path_edit.setToolTip(
+            "Local .safetensors file, HuggingFace repo (org/model),\n"
+            "or collection format (repo:filename.safetensors)."
+        )
+
+        browse_btn = QPushButton("…")
+        browse_btn.setFixedWidth(28)
+        def browse(checked=False, pe=path_edit):
+            p, _ = QFileDialog.getOpenFileName(
+                self, "Select LoRA file", "",
+                "LoRA files (*.safetensors *.bin);;All files (*)"
+            )
+            if p:
+                pe.setText(p)
+        browse_btn.clicked.connect(browse)
+
+        scale_spin = QDoubleSpinBox()
+        scale_spin.setRange(0.0, 2.0)
+        scale_spin.setSingleStep(0.1)
+        scale_spin.setValue(scale)
+        scale_spin.setFixedWidth(60)
+        scale_spin.setToolTip("Scale factor for this LoRA (1.0 = full strength)")
+
+        remove_btn = QPushButton("×")
+        remove_btn.setFixedWidth(22)
+        def remove(checked=False, r=row):
+            self._remove_lora_row(r)
+        remove_btn.clicked.connect(remove)
+
+        row_layout.addWidget(path_edit, 1)
+        row_layout.addWidget(browse_btn)
+        row_layout.addWidget(scale_spin)
+        row_layout.addWidget(remove_btn)
+
+        self._lora_list.addWidget(row)
+        self._lora_entries.append((path_edit, scale_spin, row))
+
+    def _remove_lora_row(self, row: QWidget) -> None:
+        self._lora_entries = [
+            (p, s, r) for p, s, r in self._lora_entries if r is not row
+        ]
+        self._lora_list.removeWidget(row)
+        row.deleteLater()
+
+    def _get_lora_args(self) -> list[str]:
+        """Return the --lora-paths and --lora-scales command fragments."""
+        paths = []
+        scales = []
+        for path_edit, scale_spin, _ in self._lora_entries:
+            p = path_edit.text().strip()
+            if p:
+                paths.append(p)
+                scales.append(str(scale_spin.value()))
+        if not paths:
+            return []
+        return ["--lora-paths"] + paths + ["--lora-scales"] + scales
+
+    def _add_ref_row(self, path: str = "", prompt: str = "") -> None:
+        """Add a reference image entry with thumbnail, prompt, and remove button."""
+        row = QWidget()
+        row_layout = QHBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(4)
+
+        thumb = DropThumbnail()
+        if path:
+            thumb.setImagePath(path)
+
+        prompt_edit = QLineEdit()
+        prompt_edit.setPlaceholderText("Describe this reference...")
+        prompt_edit.setText(prompt)
+
+        remove_btn = QPushButton("×")
+        remove_btn.setFixedWidth(22)
+        remove_btn.clicked.connect(lambda checked=False, r=row: self._remove_ref_row(r))
+
+        row_layout.addWidget(thumb)
+        row_layout.addWidget(prompt_edit, 1)
+        row_layout.addWidget(remove_btn)
+
+        self._ref_list.addWidget(row)
+        self._ref_entries.append((thumb, prompt_edit, row))
+
+    def _remove_ref_row(self, row: QWidget) -> None:
+        self._ref_entries = [
+            (t, p, r) for t, p, r in self._ref_entries if r is not row
+        ]
+        self._ref_list.removeWidget(row)
+        row.deleteLater()
+
+    def _build_prompt(self) -> str:
+        """Assemble the main prompt with per-reference-image descriptions."""
+        main = self._prompt.toPlainText().strip()
+        if not main:
+            return ""
+        parts = [main]
+        for i, (thumb, prompt_edit, _) in enumerate(self._ref_entries, 1):
+            ref_path = (thumb.imagePath() or "").strip()
+            ref_prompt = prompt_edit.text().strip()
+            if ref_path and ref_prompt:
+                parts.append(f"Reference image {i}: {ref_prompt}")
+        return "\n".join(parts)
+
+    def _update_preview_ratio(self, doc: object) -> None:
         if doc and doc.width() > 0:
             self._preview.setRatio(doc.height() / doc.width())
 
-
-    def canvasChanged(self, canvas):
+    def canvasChanged(self, canvas: object) -> None:
         # Disable auto mode when switching documents.
         self._auto_btn.setChecked(False)
 
@@ -1405,7 +1627,7 @@ class KritaiDocker(DockWidget):
             self._use_btn.setEnabled(False)
 
 
-def _export_selection_crop(doc, path):
+def _export_selection_crop(doc: object, path: str) -> Optional[tuple[int, int, int, int]]:
     """Export the canvas region covered by the current selection to *path*.
 
     Returns ``(x, y, w, h)`` of the selection bounds, or ``None`` if there is
