@@ -28,8 +28,10 @@ from PyQt5.QtWidgets import (
     QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
+    QFrame,
     QGraphicsOpacityEffect,
     QGroupBox,
+    QScrollArea,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -76,6 +78,7 @@ class PreviewLabel(QLabel):
         super().__init__()
         self._ratio: float = 1.0
         self._source: Optional[QPixmap] = None
+        self._updating_height: bool = False
 
     def setRatio(self, ratio: float) -> None:
         if ratio > 0 and ratio != self._ratio:
@@ -87,7 +90,13 @@ class PreviewLabel(QLabel):
         self._update_fixed_height()
 
     def _update_fixed_height(self) -> None:
-        self.setFixedHeight(max(1, self.heightForWidth(self.width())))
+        if self._updating_height:
+            return
+        self._updating_height = True
+        try:
+            self.setFixedHeight(max(1, self.heightForWidth(self.width())))
+        finally:
+            self._updating_height = False
 
     def setPixmap(self, pixmap: QPixmap) -> None:
         self._source = pixmap
@@ -320,8 +329,9 @@ class KritaiDocker(DockWidget):
         self._doc_settings: dict[str, dict] = {}
         self._upscale_settings: dict[str, dict] = {}
 
-        # Flush settings to annotation only when Krita saves the file.
+        # Flush settings to annotation on save and on application close.
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
+        Krita.instance().notifier().applicationClosing.connect(self._on_application_closing)
 
         # Polling timer: checks canvas content periodically when auto is on.
         self._poll_timer = QTimer()
@@ -342,12 +352,18 @@ class KritaiDocker(DockWidget):
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.NoFrame)
+        self.setWidget(scroll)
+
         root = QWidget()
-        self.setWidget(root)
+        scroll.setWidget(root)
 
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(6, 6, 6, 6)
-        outer.setSpacing(6)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
 
         # --- Model selector ---
         self._model = QComboBox()
@@ -392,17 +408,17 @@ class KritaiDocker(DockWidget):
             "Kontext offers instruction-based editing."
         )
         self._model.currentIndexChanged.connect(self._update_model_ui)
-        model_row = QHBoxLayout()
-        model_row.addWidget(QLabel("Model"))
-        model_row.addWidget(self._model, 1)
-        outer.addLayout(model_row)
-
         # --- Prompt ---
         self._prompt = QPlainTextEdit()
         self._prompt.setPlaceholderText("Prompt...")
         self._prompt.setToolTip("Describe what you want the image to look like.")
         self._prompt.setFixedHeight(60)
         outer.addWidget(self._prompt)
+
+        model_row = QHBoxLayout()
+        model_row.addWidget(QLabel("Model"))
+        model_row.addWidget(self._model, 1)
+        outer.addLayout(model_row)
 
         # --- Negative prompt ---
         self._negative_prompt = QLineEdit()
@@ -419,6 +435,7 @@ class KritaiDocker(DockWidget):
         form = QFormLayout(settings_widget)
         form.setContentsMargins(0, 0, 0, 0)
         form.setSpacing(4)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
         outer.addWidget(settings_widget)
 
         self._quantize = QSpinBox()
@@ -504,8 +521,15 @@ class KritaiDocker(DockWidget):
         self._scale_spin.valueChanged.connect(
             lambda v: self._scale.setValue(int(v * 100))
         )
+        self._scale_input = QCheckBox("Input")
+        self._scale_input.setToolTip(
+            "When checked, the input image is pre-scaled before sending to mflux\n"
+            "instead of passing --width/--height to the command.\n"
+            "Required for edit models that don't accept width/height arguments."
+        )
         scale_layout.addWidget(self._scale)
         scale_layout.addWidget(self._scale_spin)
+        scale_layout.addWidget(self._scale_input)
         scale_row.setToolTip(
             "Scale of the canvas sent to mflux relative to its original size.\n"
             "0.5 = half resolution (faster, less VRAM).\n"
@@ -541,7 +565,9 @@ class KritaiDocker(DockWidget):
         ref_content.addLayout(self._ref_list)
         self._ref_entries = []  # list of (thumbnail, prompt_edit, row_widget)
 
-        add_ref_btn = QPushButton("+ Add Reference")
+        add_ref_btn = QToolButton()
+        add_ref_btn.setIcon(Krita.instance().icon("list-add"))
+        add_ref_btn.setToolTip("Add reference image")
         add_ref_btn.clicked.connect(lambda: self._add_ref_row())
         ref_content.addWidget(add_ref_btn)
 
@@ -559,7 +585,9 @@ class KritaiDocker(DockWidget):
         lora_content.addLayout(self._lora_list)
         self._lora_entries = []  # list of (path_widget, scale_widget, row_widget)
 
-        add_lora_btn = QPushButton("+ Add LoRA")
+        add_lora_btn = QToolButton()
+        add_lora_btn.setIcon(Krita.instance().icon("list-add"))
+        add_lora_btn.setToolTip("Add LoRA")
         add_lora_btn.clicked.connect(lambda: self._add_lora_row())
         lora_content.addWidget(add_lora_btn)
 
@@ -569,6 +597,11 @@ class KritaiDocker(DockWidget):
         # --- Buttons ---
         btn_row = QHBoxLayout()
         outer.addLayout(btn_row)
+
+        sep_bottom = QFrame()
+        sep_bottom.setFrameShape(QFrame.HLine)
+        sep_bottom.setFrameShadow(QFrame.Sunken)
+        outer.addWidget(sep_bottom)
 
         self._auto_btn = QToolButton()
         self._auto_btn.setCheckable(True)
@@ -582,6 +615,7 @@ class KritaiDocker(DockWidget):
         self._generate_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._generate_btn.setEnabled(False)
         self._generate_btn.setToolTip("No active document.")
+        self._generate_btn.setDefault(True)
         btn_row.addWidget(self._generate_btn)
         btn_row.addWidget(self._auto_btn)
 
@@ -604,7 +638,7 @@ class KritaiDocker(DockWidget):
 
         self._use_btn = QToolButton()
         self._use_btn.setToolTip("Add result as a new layer in the document")
-        self._use_btn.setIcon(Krita.instance().icon("addlayer"))
+        self._use_btn.setIcon(Krita.instance().icon("document-new"))
         self._use_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._use_btn.setEnabled(False)
         self._use_btn.clicked.connect(self._import_to_layer)
@@ -684,6 +718,7 @@ class KritaiDocker(DockWidget):
             self._scale.valueChanged,
             self._seed.valueChanged,
             self._random_seed.toggled,
+            self._scale_input.toggled,
         ]:
             signal.connect(self._save_settings)
 
@@ -703,6 +738,7 @@ class KritaiDocker(DockWidget):
             self._scale.valueChanged,
             self._seed.valueChanged,
             self._random_seed.toggled,
+            self._scale_input.toggled,
         ]:
             signal.connect(self._on_setting_changed)
 
@@ -729,6 +765,7 @@ class KritaiDocker(DockWidget):
             "guidance": self._guidance.value(),
             "strength": self._strength.value() / 100,
             "scale": self._scale.value() / 100,
+            "scale_input": self._scale_input.isChecked(),
             "seed": self._seed.value(),
             "random_seed": self._random_seed.isChecked(),
             "loras": [
@@ -736,29 +773,43 @@ class KritaiDocker(DockWidget):
                 for e, p, s, _ in self._lora_entries if p.text().strip()
             ],
             "upscale": self._upscale_settings.get(uid, {}),
+            "preview_path": self._tmp_output or "",
         }
         prev = self._doc_settings.get(uid)
         self._doc_settings[uid] = new
         if prev != new:
             doc.setModified(True)
 
+    def _flush_settings_to_doc(self, doc: object) -> None:
+        """Write in-memory settings for *doc* into its KRA annotation."""
+        filename = doc.fileName()
+        if not filename:
+            return
+        uid = filename
+        # Migrate settings stored under the old id-based key (before first save).
+        old_uid = str(id(doc))
+        if old_uid != uid and old_uid in self._doc_settings:
+            self._doc_settings[uid] = self._doc_settings.pop(old_uid)
+        data = self._doc_settings.get(uid)
+        if data:
+            raw = json.dumps(data).encode("utf-8")
+            doc.setAnnotation(self.ANNOTATION_TYPE, "Kritai settings", QByteArray(raw))
+            doc.setModified(False)
+
     def _on_image_saved(self, filename: str) -> None:
         """Flush in-memory settings to the document annotation on save."""
-        # Ensure in-memory settings are up-to-date before flushing.
         self._save_settings()
         for doc in Krita.instance().documents():
             if doc.fileName() == filename:
-                uid = doc.fileName() or str(id(doc))
-                # Migrate settings stored under the old id-based key (before first save).
-                old_uid = str(id(doc))
-                if old_uid != uid and old_uid in self._doc_settings:
-                    self._doc_settings[uid] = self._doc_settings.pop(old_uid)
-                data = self._doc_settings.get(uid)
-                if data:
-                    raw = json.dumps(data).encode("utf-8")
-                    doc.setAnnotation(self.ANNOTATION_TYPE, "Kritai settings", QByteArray(raw))
-                    doc.setModified(False)
+                self._flush_settings_to_doc(doc)
                 break
+
+    def _on_application_closing(self) -> None:
+        """Flush settings for all open documents before Krita quits."""
+        self._save_settings()
+        for doc in Krita.instance().documents():
+            if doc.fileName():
+                self._flush_settings_to_doc(doc)
 
     def _load_settings(self, doc: object) -> None:
         uid = doc.fileName() or str(id(doc))
@@ -780,7 +831,7 @@ class KritaiDocker(DockWidget):
         widgets = [
             self._prompt, self._negative_prompt, self._model,
             self._quantize, self._steps, self._guidance,
-            self._strength, self._scale, self._seed, self._random_seed,
+            self._strength, self._scale, self._scale_input, self._seed, self._random_seed,
         ]
         for w in widgets:
             w.blockSignals(True)
@@ -810,6 +861,7 @@ class KritaiDocker(DockWidget):
         scale_val = int(data.get("scale", data.get("downscale", data.get("resolution_scale", 0.5))) * 100)
         self._scale.setValue(scale_val)
         self._scale_spin.setValue(scale_val / 100)
+        self._scale_input.setChecked(data.get("scale_input", False))
         self._seed.setValue(data.get("seed", 0))
         self._random_seed.setChecked(data.get("random_seed", False))
 
@@ -827,6 +879,15 @@ class KritaiDocker(DockWidget):
         if upscale:
             self._upscale_settings[uid] = upscale
         self._seed.setDisabled(self._random_seed.isChecked())
+
+        # Restore preview image if the temp file still exists.
+        preview_path = data.get("preview_path", "")
+        if preview_path and os.path.exists(preview_path):
+            self._tmp_output = preview_path
+            pixmap = QPixmap(preview_path)
+            if not pixmap.isNull():
+                self._preview.setPixmap(pixmap)
+                self._doc_previews[uid] = pixmap
 
         for w in widgets:
             w.blockSignals(False)
@@ -964,8 +1025,10 @@ class KritaiDocker(DockWidget):
         )
         needs_reference = rest[0] if rest else False
 
-        # Edit models don't accept --width/--height; pre-scale the input instead.
-        if needs_reference and abs(scale - 1.0) >= 0.001:
+        # Pre-scale the input image when the checkbox is on (or for edit models
+        # that don't accept --width/--height arguments).
+        scale_input = self._scale_input.isChecked() or needs_reference
+        if scale_input and abs(scale - 1.0) >= 0.001:
             img = QImage(self._tmp_input)
             if not img.isNull():
                 img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
@@ -992,7 +1055,7 @@ class KritaiDocker(DockWidget):
             "--output", self._tmp_output,
         ]
 
-        if abs(scale - 1.0) >= 0.001 and not needs_reference:
+        if abs(scale - 1.0) >= 0.001 and not scale_input:
             cmd += ["--width", str(target_w), "--height", str(target_h)]
 
         if supports_guidance:
