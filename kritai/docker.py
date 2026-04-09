@@ -78,25 +78,31 @@ class PreviewLabel(QLabel):
         super().__init__()
         self._ratio: float = 1.0
         self._source: Optional[QPixmap] = None
-        self._updating_height: bool = False
+        self._height_update_pending: bool = False
 
     def setRatio(self, ratio: float) -> None:
         if ratio > 0 and ratio != self._ratio:
             self._ratio = ratio
-            self._update_fixed_height()
+            self._schedule_height_update()
 
     def resizeEvent(self, event: QEvent) -> None:
         super().resizeEvent(event)
-        self._update_fixed_height()
+        self._schedule_height_update()
 
-    def _update_fixed_height(self) -> None:
-        if self._updating_height:
+    def _schedule_height_update(self) -> None:
+        """Defer height update to the next event-loop tick to avoid recursive
+        layout invalidation (PreviewLabel.setFixedHeight -> parent layout ->
+        QPlainTextEdit.resizeEvent -> layout -> PreviewLabel.resizeEvent …)."""
+        if self._height_update_pending:
             return
-        self._updating_height = True
-        try:
-            self.setFixedHeight(max(1, self.heightForWidth(self.width())))
-        finally:
-            self._updating_height = False
+        self._height_update_pending = True
+        QTimer.singleShot(0, self._apply_fixed_height)
+
+    def _apply_fixed_height(self) -> None:
+        self._height_update_pending = False
+        target = max(1, self.heightForWidth(self.width()))
+        if target != self.height():
+            self.setFixedHeight(target)
 
     def setPixmap(self, pixmap: QPixmap) -> None:
         self._source = pixmap
@@ -890,7 +896,6 @@ class KritaiDocker(DockWidget):
         if checked:
             self._last_canvas_hash = self._canvas_hash()
             self._poll_timer.start()
-            self._generate()
         else:
             self._poll_timer.stop()
             self._debounce_timer.stop()
