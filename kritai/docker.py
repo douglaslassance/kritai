@@ -7,6 +7,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 from typing import Optional
 
 from krita import DockWidget, InfoObject
@@ -692,6 +693,13 @@ class KritaiDocker(DockWidget):
         self._preview.setStyleSheet("border-radius: 4px;")
         self._preview.setVisible(False)
         outer.addWidget(self._preview)
+
+        self._time_label = QLabel()
+        self._time_label.setAlignment(Qt.AlignLeft)
+        self._time_label.setStyleSheet("color: #888; font-size: 11px;")
+        self._time_label.setVisible(False)
+        outer.addWidget(self._time_label)
+
         outer.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding))
 
         self._update_model_ui()
@@ -1069,6 +1077,7 @@ class KritaiDocker(DockWidget):
         cmd += self._get_lora_args()
 
         self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
+        self._gen_start_time = time.monotonic()
         self._set_busy(True)
         self._thread = GenerateThread(cmd, self._tmp_output)
         self._thread.finished.connect(self._on_finished)
@@ -1086,6 +1095,10 @@ class KritaiDocker(DockWidget):
             f"File exists: {exists}, size: {size} bytes"
         )
         self._show_preview(output_path)
+        elapsed = time.monotonic() - self._gen_start_time
+        minutes, seconds = divmod(int(elapsed), 60)
+        self._time_label.setText(f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s")
+        self._time_label.setVisible(True)
         self._progress.setVisible(False)
 
     def _on_error(self, message: str) -> None:
@@ -1748,9 +1761,11 @@ class KritaiDocker(DockWidget):
                 self._use_btn.setEnabled(True)
             else:
                 self._preview.setVisible(False)
+                self._time_label.setVisible(False)
                 self._use_btn.setEnabled(False)
         else:
             self._preview.setVisible(False)
+            self._time_label.setVisible(False)
             self._use_btn.setEnabled(False)
         self._update_generate_btn()
 
