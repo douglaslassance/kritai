@@ -210,7 +210,7 @@ class CameraOrbitWidget(QWidget):
     _VY = math.radians(30)   # scene yaw  (rotate world around Y before projecting)
     _VP = math.radians(25)   # view pitch (tilt camera down)
 
-    _R_GRID    = 1.0   # fixed grid radius — independent of camera distance
+    _R_GRID    = 1.4   # fixed grid radius — independent of camera distance
 
     _R_HANDLE  = 5    # handle draw radius px
     _R_HIT     = 14   # click hit radius px
@@ -220,12 +220,15 @@ class CameraOrbitWidget(QWidget):
         self._az    = 0
         self._el    = 0
         self._dist  = 100        # range 60–180
-        self._drag  = None       # 'az' | 'el' | 'dist'
+        self._drag           = False
         self._drag_origin    = None
-        self._drag_start_val = None
-        self.setMinimumSize(160, 150)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setFixedHeight(180)
+        self._drag_start_az  = 0
+        self._drag_start_el  = 0
+        self._hovered        = False
+        self.setFixedWidth(160)
+        self.setMinimumHeight(80)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
 
     # ------------------------------------------------------------------ api
 
@@ -254,10 +257,10 @@ class CameraOrbitWidget(QWidget):
     # --------------------------------------------------------- 3-D math
 
     def _scale(self) -> float:
-        return min(self.width(), self.height()) * 0.27
+        return min(self.width(), self.height()) * 0.35
 
     def _origin(self) -> QPointF:
-        return QPointF(self.width() * 0.5, self.height() * 0.58)
+        return QPointF(self.width() * 0.5, self.height() * 0.5)
 
     def _project(self, x: float, y: float, z: float) -> QPointF:
         vy, vp = self._VY, self._VP
@@ -287,14 +290,8 @@ class CameraOrbitWidget(QWidget):
 
     # ------------------------------------------------ handle screen positions
 
-    def _pos_az(self) -> QPointF:
-        """Teal handle: on equatorial ring (y=0) at current azimuth."""
-        r = self._dist / 100.0
-        a = math.radians(self._az)
-        return self._project(r * math.sin(a), 0.0, r * math.cos(a))
-
-    def _pos_el(self) -> QPointF:
-        """Magenta handle: camera position (on both arcs' intersection)."""
+    def _pos_handle(self) -> QPointF:
+        """Camera position projected onto screen — sits on the elevation arc."""
         return self._project(*self._cam_xyz())
 
     # --------------------------------------------------------------- painting
@@ -306,7 +303,7 @@ class CameraOrbitWidget(QWidget):
         bg      = pal.color(pal.Window).darker(150)
         accent  = pal.color(pal.Highlight)
         grid_c  = QColor(pal.color(pal.Midlight))
-        grid_c.setAlpha(90)
+        grid_c.setAlpha(160)
         return bg, grid_c, accent
 
     def paintEvent(self, event) -> None:
@@ -317,7 +314,7 @@ class CameraOrbitWidget(QWidget):
         self._draw_grid(p, grid_c)
         self._draw_orbit_ring(p, accent)
         self._draw_elevation_arc(p, accent)
-        self._draw_handles(p, accent)
+        self._draw_handles(p, accent, grid_c)
 
     def _draw_grid(self, p: QPainter, grid_c: QColor) -> None:
         r = self._R_GRID
@@ -367,52 +364,56 @@ class CameraOrbitWidget(QWidget):
             p.setPen(QPen(col, 1.5))
             p.drawLine(self._project(x1, y1, z1), self._project(x2, y2, z2))
 
-    def _draw_handles(self, p: QPainter, accent: QColor) -> None:
+    def _draw_handles(self, p: QPainter, accent: QColor, grid_c: QColor) -> None:
         r = float(self._R_HANDLE)
-        p.setPen(QPen(QColor(255, 255, 255, 150), 1))
+        if self._hovered or self._drag:
+            from PyQt5.QtWidgets import QApplication
+            text_c = QApplication.palette().color(QApplication.palette().WindowText)
+            p.setPen(QPen(text_c, 1.5))
+        else:
+            p.setPen(Qt.NoPen)
         p.setBrush(QBrush(accent))
-        p.drawEllipse(self._pos_el(), r, r)
+        p.drawEllipse(self._pos_handle(), r, r)
 
     # -------------------------------------------------------- mouse events
+
+    def enterEvent(self, event) -> None:
+        self._hovered = True
+        self.update()
+
+    def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self.update()
 
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.LeftButton:
             return
-        pos = QPointF(event.pos())
-        best_name, best_d2, best_val = None, self._R_HIT ** 2, 0
-        for name, hpos, val in (
-            ('az', self._pos_az(), self._az),
-            ('el', self._pos_el(), self._el),
-        ):
-            d2 = (pos.x() - hpos.x()) ** 2 + (pos.y() - hpos.y()) ** 2
-            if d2 < best_d2:
-                best_name, best_d2, best_val = name, d2, val
-        if best_name:
-            self._drag            = best_name
-            self._drag_origin     = pos
-            self._drag_start_val  = best_val
-            self.setCursor(Qt.ClosedHandCursor)
+        self._drag           = 'free'
+        self._drag_origin    = QPointF(event.pos())
+        self._drag_start_az  = self._az
+        self._drag_start_el  = self._el
+        self.setCursor(Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, event) -> None:
-        if self._drag is None:
+        if not self._drag:
             return
         pos = QPointF(event.pos())
         dx  = pos.x() - self._drag_origin.x()
         dy  = pos.y() - self._drag_origin.y()
 
-        if self._drag == 'az':
-            new = max(-180, min(180, int(round(self._drag_start_val + dx))))
-            if self._az != new:
-                self._az = new
-                self.azimuth_changed.emit(new)
-                self.update()
-        elif self._drag == 'el':
-            new = max(-90, min(90, int(round(self._drag_start_val - dy * 0.8))))
-            if self._el != new:
-                self._el = new
-                self.elevation_changed.emit(new)
-                self.update()
-                self.update()
+        new_az = max(-180, min(180, int(round(self._drag_start_az + dx))))
+        new_el = max(-90,  min(90,  int(round(self._drag_start_el - dy * 0.8))))
+        changed = False
+        if self._az != new_az:
+            self._az = new_az
+            self.azimuth_changed.emit(new_az)
+            changed = True
+        if self._el != new_el:
+            self._el = new_el
+            self.elevation_changed.emit(new_el)
+            changed = True
+        if changed:
+            self.update()
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
@@ -780,10 +781,7 @@ class KritaiDocker(DockWidget):
         log_btns_layout.addWidget(self._clear_btn)
         log_btns_layout.addStretch()
 
-        outer.addWidget(self._log)
-        outer.addWidget(self._log_btns)
-
-        # --- Preview image ---
+        # --- Preview image — placed directly under progress, above log ---
         self._preview = PreviewLabel()
         self._preview.setAlignment(Qt.AlignCenter)
         self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -797,6 +795,9 @@ class KritaiDocker(DockWidget):
         self._time_label.setStyleSheet("color: #888; font-size: 11px;")
         self._time_label.setVisible(False)
         outer.addWidget(self._time_label)
+
+        outer.addWidget(self._log)
+        outer.addWidget(self._log_btns)
 
         outer.addStretch()
 
@@ -1047,16 +1048,19 @@ class KritaiDocker(DockWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        # --- 3-D orbit widget ---
-        self._orbit = CameraOrbitWidget()
-        layout.addWidget(self._orbit)
+        # --- 3-D orbit widget + angle controls side by side ---
+        orbit_row = QHBoxLayout()
+        orbit_row.setSpacing(8)
 
-        # --- Numeric readouts (synced to orbit widget) ---
+        self._orbit = CameraOrbitWidget()
+        orbit_row.addWidget(self._orbit)
+
+        # Numeric readouts (synced to orbit widget).
         cam_form = QFormLayout()
         cam_form.setContentsMargins(0, 0, 0, 0)
         cam_form.setSpacing(4)
         cam_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        cam_form.setHorizontalSpacing(20)
+        cam_form.setHorizontalSpacing(8)
 
         def _int_slider_row(lo, hi, default, suffix, tooltip):
             row = QWidget()
@@ -1082,37 +1086,50 @@ class KritaiDocker(DockWidget):
             hl.addWidget(slider)
             hl.addWidget(spin)
             hl.addWidget(reset_btn)
-            return row, slider
+            return row, slider, spin
 
-        az_row, self._angle_azimuth = _int_slider_row(
+        az_row, self._angle_azimuth, self._angle_azimuth_spin = _int_slider_row(
             -180, 180, 0, "°", "Horizontal rotation around the subject (0° = front).")
         self._angle_azimuth.valueChanged.connect(self._orbit.setAzimuth)
         self._orbit.azimuth_changed.connect(self._angle_azimuth.setValue)
         cam_form.addRow("Azimuth", az_row)
 
-        el_row, self._angle_elevation = _int_slider_row(
+        el_row, self._angle_elevation, self._angle_elevation_spin = _int_slider_row(
             -90, 90, 0, "°", "Vertical angle (−90° = bottom, 0° = eye-level, 90° = top).")
         self._angle_elevation.valueChanged.connect(self._orbit.setElevation)
         self._orbit.elevation_changed.connect(self._angle_elevation.setValue)
         cam_form.addRow("Elevation", el_row)
 
-        dist_row, self._angle_distance = _int_slider_row(
+        dist_row, self._angle_distance, self._angle_distance_spin = _int_slider_row(
             60, 180, 100, "", "Camera distance (60 = close-up, 100 = medium, 180 = wide).")
         self._angle_distance.valueChanged.connect(self._orbit.setDistance)
         self._orbit.distance_changed.connect(self._angle_distance.setValue)
         cam_form.addRow("Distance", dist_row)
 
-        layout.addLayout(cam_form)
+        cam_form_widget = QWidget()
+        cam_form_widget.setLayout(cam_form)
+        cam_form_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        # --- Preset buttons ---
+        # Right column: sliders on top, presets below.
+        right_col = QVBoxLayout()
+        right_col.setSpacing(4)
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.addWidget(cam_form_widget)
+
         preset_row = QHBoxLayout()
-        preset_row.setSpacing(4)
+        preset_row.setSpacing(3)
+        preset_row.setContentsMargins(0, 0, 0, 0)
         for name, (az, el, dist) in ANGLE_PRESETS.items():
             btn = QPushButton(name)
             btn.setToolTip(f"Azimuth {az}°, Elevation {el}°, Distance {dist}")
             btn.clicked.connect(lambda checked=False, a=az, e=el, d=dist: self._apply_angle_preset(a, e, d))
             preset_row.addWidget(btn)
-        layout.addLayout(preset_row)
+        right_col.addLayout(preset_row)
+        right_col.addStretch()
+
+        orbit_row.addLayout(right_col, stretch=1)
+        orbit_row.setAlignment(Qt.AlignTop)
+        layout.addLayout(orbit_row)
 
         # --- Settings form ---
         settings_widget = QWidget()
@@ -1134,6 +1151,13 @@ class KritaiDocker(DockWidget):
         self._angle_steps.setValue(4)
         self._angle_steps.setToolTip("Number of denoising steps.")
         form.addRow("Steps", self._angle_steps)
+
+        self._angle_guidance = QDoubleSpinBox()
+        self._angle_guidance.setRange(0.0, 20.0)
+        self._angle_guidance.setSingleStep(0.5)
+        self._angle_guidance.setValue(4.0)
+        self._angle_guidance.setToolTip("Guidance scale (classifier-free guidance strength).")
+        form.addRow("Guidance", self._angle_guidance)
 
         scale_row, self._angle_scale, self._angle_scale_spin = self._make_slider_row(
             0, 100, 50, "Scale of the canvas sent to mflux relative to its original size."
@@ -1291,6 +1315,7 @@ class KritaiDocker(DockWidget):
             self._angle_distance.valueChanged,
             self._angle_quantize.valueChanged,
             self._angle_steps.valueChanged,
+            self._angle_guidance.valueChanged,
             self._angle_scale.valueChanged,
             self._angle_seed.valueChanged,
             self._angle_random_seed.toggled,
@@ -1326,6 +1351,7 @@ class KritaiDocker(DockWidget):
             self._angle_distance.valueChanged,
             self._angle_quantize.valueChanged,
             self._angle_steps.valueChanged,
+            self._angle_guidance.valueChanged,
             self._angle_scale.valueChanged,
             self._angle_seed.valueChanged,
             self._angle_random_seed.toggled,
@@ -1388,6 +1414,7 @@ class KritaiDocker(DockWidget):
                 "distance": self._angle_distance.value(),
                 "quantize": self._angle_quantize.value(),
                 "steps": self._angle_steps.value(),
+                "guidance": self._angle_guidance.value(),
                 "scale": self._angle_scale.value() / 100,
                 "seed": self._angle_seed.value(),
                 "random_seed": self._angle_random_seed.isChecked(),
@@ -1398,6 +1425,12 @@ class KritaiDocker(DockWidget):
         prev = self._doc_settings.get(uid)
         self._doc_settings[uid] = new
         if prev != new:
+            # Write annotation immediately so it's included in any subsequent
+            # Krita save — imageSaved fires *after* the file is written, so
+            # deferring to _flush_settings_to_doc would miss the current save.
+            if doc.fileName():
+                raw = json.dumps(new).encode("utf-8")
+                doc.setAnnotation(self.ANNOTATION_TYPE, "Kritai settings", QByteArray(raw))
             doc.setModified(True)
 
     def _flush_settings_to_doc(self, doc: object) -> None:
@@ -1458,8 +1491,10 @@ class KritaiDocker(DockWidget):
             self._edit_prompt, self._edit_model,
             self._edit_quantize, self._edit_steps, self._edit_guidance,
             self._edit_strength, self._edit_scale, self._edit_seed, self._edit_random_seed,
-            self._angle_azimuth, self._angle_elevation, self._angle_distance,
-            self._orbit, self._angle_quantize, self._angle_steps,
+            self._angle_azimuth, self._angle_azimuth_spin,
+            self._angle_elevation, self._angle_elevation_spin,
+            self._angle_distance, self._angle_distance_spin,
+            self._orbit, self._angle_quantize, self._angle_steps, self._angle_guidance,
             self._angle_scale, self._angle_seed, self._angle_random_seed,
             self._tabs,
         ]
@@ -1534,13 +1569,17 @@ class KritaiDocker(DockWidget):
         el = angle.get("elevation", 0)
         dv = angle.get("distance", 100)
         self._angle_azimuth.setValue(az)
+        self._angle_azimuth_spin.setValue(az)
         self._angle_elevation.setValue(el)
+        self._angle_elevation_spin.setValue(el)
         self._angle_distance.setValue(dv)
+        self._angle_distance_spin.setValue(dv)
         self._orbit.setAzimuth(az)
         self._orbit.setElevation(el)
         self._orbit.setDistance(dv)
         self._angle_quantize.setValue(angle.get("quantize", 4))
         self._angle_steps.setValue(angle.get("steps", 4))
+        self._angle_guidance.setValue(angle.get("guidance", 4.0))
         ascv = int(angle.get("scale", 0.5) * 100)
         self._angle_scale.setValue(ascv)
         self._angle_scale_spin.setValue(ascv / 100)
@@ -1848,6 +1887,7 @@ class KritaiDocker(DockWidget):
         ]
         if self._angle_quantize.value() > 0:
             cmd += ["--quantize", str(self._angle_quantize.value())]
+        cmd += ["--guidance", str(self._angle_guidance.value())]
         if not self._angle_random_seed.isChecked():
             cmd += ["--seed", str(self._angle_seed.value())]
         # Append angle LoRAs: lightning speed + multi-angle.
