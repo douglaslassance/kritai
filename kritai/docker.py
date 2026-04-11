@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -15,13 +16,15 @@ from PyQt5.QtCore import (
     QByteArray,
     QEvent,
     QObject,
+    QPointF,
+    QRectF,
     QSize,
     Qt,
     QThread,
     QTimer,
     pyqtSignal,
 )
-from PyQt5.QtGui import QFontDatabase, QImage, QPixmap
+from PyQt5.QtGui import QBrush, QColor, QFontDatabase, QImage, QPainter, QPen, QPixmap
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -71,30 +74,33 @@ MODEL_CLI = {
 GENERATE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
 EDIT_MODELS = ["flux2-edit", "kontext-dev", "kontext-schnell"]
 
-# Angle LoRA configuration.
-ANGLE_LORA_REPO = "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
-ANGLE_TRIGGER_TOKEN = "<sks>"
+# Angle LoRA configuration: lightning speed LoRA + multi-angle LoRA.
+ANGLE_LORA_PATHS = [
+    "lightx2v/Qwen-Image-Lightning:Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors",
+    "dx8152/Qwen-Edit-2509-Multiple-angles",
+]
+ANGLE_LORA_SCALES = ["0.5", "1.0"]
 
 AZIMUTH_MAP = [
     (0, "front view"), (45, "front-right quarter view"),
     (90, "right side view"), (135, "back-right quarter view"),
-    (180, "back view"), (225, "back-left quarter view"),
-    (270, "left side view"), (315, "front-left quarter view"),
+    (180, "back view"), (-135, "back-left quarter view"),
+    (-90, "left side view"), (-45, "front-left quarter view"),
 ]
 ELEVATION_MAP = [
-    (-30, "low-angle shot"), (0, "eye-level shot"),
-    (30, "elevated shot"), (60, "high-angle shot"),
+    (-90, "extreme low-angle shot"), (-30, "low-angle shot"), (0, "eye-level shot"),
+    (30, "elevated shot"), (60, "high-angle shot"), (90, "top-down shot"),
 ]
 DISTANCE_MAP = [
     (60, "close-up"), (100, "medium shot"), (180, "wide shot"),
 ]
 ANGLE_PRESETS = {
-    "Front":  (0, 0, 100),
-    "Right":  (90, 0, 100),
-    "Back":   (180, 0, 100),
-    "Left":   (270, 0, 100),
-    "Top":    (0, 60, 100),
-    "Low":    (0, -30, 100),
+    "Front":  (0,    0,   100),
+    "Right":  (90,   0,   100),
+    "Back":   (180,  0,   100),
+    "Left":   (-90,  0,   100),
+    "Top":    (0,    90,  100),
+    "Bottom": (0,    -90, 100),
 }
 
 # How often (ms) to poll canvas for changes when auto-mode is on.
@@ -163,37 +169,255 @@ class PreviewLabel(QLabel):
 
 
 class _AdaptiveTabWidget(QTabWidget):
-    """QTabWidget whose height tracks the active tab only.
+    """QTabWidget whose size hint tracks the active tab only.
 
-    The standard QTabWidget reports a sizeHint tall enough to fit every tab,
-    which causes the panel to be unnecessarily tall when a shorter tab is
-    selected.  We only override the *height* — width is left to the base class
-    so the docker retains its normal minimum/preferred width.  Callers must
-    invoke updateGeometry() after switching tabs so the parent layout reflows.
+    Both width and height are derived from the active tab's content so the
+    docker's natural minimum width equals the tab widget's minimum width —
+    they always agree.  Call updateGeometry() after switching tabs.
     """
 
     def sizeHint(self) -> QSize:
-        base = super().sizeHint()
-        return QSize(base.width(), self._preferred_height())
+        return self._hint_for(preferred=True)
 
     def minimumSizeHint(self) -> QSize:
-        base = super().minimumSizeHint()
-        w = self.currentWidget()
-        if w is None:
-            return base
-        tab_bar_h = self.tabBar().sizeHint().height()
-        margins = self.contentsMargins()
-        min_h = w.minimumSizeHint().height() + tab_bar_h + margins.top() + margins.bottom() + 4
-        return QSize(base.width(), max(min_h, tab_bar_h + 20))
+        return self._hint_for(preferred=False)
 
-    def _preferred_height(self) -> int:
+    def _hint_for(self, preferred: bool) -> QSize:
         w = self.currentWidget()
         if w is None:
-            return super().sizeHint().height()
-        tab_bar_h = self.tabBar().sizeHint().height()
-        margins = self.contentsMargins()
-        extra = tab_bar_h + margins.top() + margins.bottom() + 4
-        return max(w.sizeHint().height() + extra, tab_bar_h + 20)
+            return super().sizeHint() if preferred else super().minimumSizeHint()
+        content = w.sizeHint() if preferred else w.minimumSizeHint()
+        tab_bar  = self.tabBar()
+        margins  = self.contentsMargins()
+        w_extra  = margins.left() + margins.right()
+        h_extra  = tab_bar.sizeHint().height() + margins.top() + margins.bottom() + 4
+        min_tab_w = tab_bar.minimumSizeHint().width()
+        return QSize(
+            max(content.width() + w_extra, min_tab_w),
+            max(content.height() + h_extra, tab_bar.sizeHint().height() + 20),
+        )
+
+
+class CameraOrbitWidget(QWidget):
+    """Interactive 3D orbit widget: drag the teal dot to rotate azimuth,
+    the magenta dot (camera) to change elevation, the amber dot to zoom."""
+
+    azimuth_changed   = pyqtSignal(int)   # –180 – 180
+    elevation_changed = pyqtSignal(int)   # –90 – 90
+    distance_changed  = pyqtSignal(int)   # 60 – 180
+
+    # Fixed isometric view direction (not user-controllable)
+    _VY = math.radians(30)   # scene yaw  (rotate world around Y before projecting)
+    _VP = math.radians(25)   # view pitch (tilt camera down)
+
+    _R_GRID    = 1.0   # fixed grid radius — independent of camera distance
+
+    _R_HANDLE  = 5    # handle draw radius px
+    _R_HIT     = 14   # click hit radius px
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._az    = 0
+        self._el    = 0
+        self._dist  = 100        # range 60–180
+        self._drag  = None       # 'az' | 'el' | 'dist'
+        self._drag_origin    = None
+        self._drag_start_val = None
+        self.setMinimumSize(160, 150)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.setFixedHeight(180)
+
+    # ------------------------------------------------------------------ api
+
+    def setAzimuth(self, v: int) -> None:
+        v = max(-180, min(180, int(v)))
+        if self._az != v:
+            self._az = v
+            self.update()
+
+    def setElevation(self, v: int) -> None:
+        v = max(-90, min(90, int(v)))
+        if self._el != v:
+            self._el = v
+            self.update()
+
+    def setDistance(self, v: int) -> None:
+        v = max(60, min(180, int(v)))
+        if self._dist != v:
+            self._dist = v
+            self.update()
+
+    def azimuth(self)  -> int: return self._az
+    def elevation(self) -> int: return self._el
+    def distance(self)  -> int: return self._dist
+
+    # --------------------------------------------------------- 3-D math
+
+    def _scale(self) -> float:
+        return min(self.width(), self.height()) * 0.27
+
+    def _origin(self) -> QPointF:
+        return QPointF(self.width() * 0.5, self.height() * 0.58)
+
+    def _project(self, x: float, y: float, z: float) -> QPointF:
+        vy, vp = self._VY, self._VP
+        rx =  x * math.cos(vy) + z * math.sin(vy)
+        rz = -x * math.sin(vy) + z * math.cos(vy)
+        sx = rx
+        sy = -y * math.cos(vp) + rz * math.sin(vp)
+        o = self._origin()
+        s = self._scale()
+        return QPointF(o.x() + sx * s, o.y() + sy * s)
+
+    def _cam_xyz(self, az=None, el=None, dist=None):
+        if az   is None: az   = self._az
+        if el   is None: el   = self._el
+        if dist is None: dist = self._dist
+        a = math.radians(az)
+        e = math.radians(el)
+        r = dist / 100.0
+        return (r * math.cos(e) * math.sin(a),
+                r * math.sin(e),
+                r * math.cos(e) * math.cos(a))
+
+    def _screen_depth(self, x, y, z) -> float:
+        """Negative = in front of viewer (use to decide front vs back)."""
+        vy = self._VY
+        return -x * math.sin(vy) + z * math.cos(vy)
+
+    # ------------------------------------------------ handle screen positions
+
+    def _pos_az(self) -> QPointF:
+        """Teal handle: on equatorial ring (y=0) at current azimuth."""
+        r = self._dist / 100.0
+        a = math.radians(self._az)
+        return self._project(r * math.sin(a), 0.0, r * math.cos(a))
+
+    def _pos_el(self) -> QPointF:
+        """Magenta handle: camera position (on both arcs' intersection)."""
+        return self._project(*self._cam_xyz())
+
+    # --------------------------------------------------------------- painting
+
+    def _palette_colors(self):
+        """Return (bg, grid, ring, arc) derived from the live Qt palette."""
+        from PyQt5.QtWidgets import QApplication
+        pal     = QApplication.palette()
+        bg      = pal.color(pal.Window).darker(150)
+        accent  = pal.color(pal.Highlight)
+        grid_c  = QColor(pal.color(pal.Midlight))
+        grid_c.setAlpha(90)
+        return bg, grid_c, accent
+
+    def paintEvent(self, event) -> None:
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        bg, grid_c, accent = self._palette_colors()
+        p.fillRect(self.rect(), bg)
+        self._draw_grid(p, grid_c)
+        self._draw_orbit_ring(p, accent)
+        self._draw_elevation_arc(p, accent)
+        self._draw_handles(p, accent)
+
+    def _draw_grid(self, p: QPainter, grid_c: QColor) -> None:
+        r = self._R_GRID
+        y = -0.35 * r
+        p.setPen(QPen(grid_c, 1, Qt.DotLine))
+        n = 5
+        for i in range(-n, n + 1):
+            t = i * r / n
+            p.drawLine(self._project(-r, y, t), self._project(r,  y, t))
+            p.drawLine(self._project(t,  y, -r), self._project(t, y, r))
+
+    def _fog_alpha(self, depth: float, r: float) -> int:
+        """Map screen depth → alpha: front (+r) = 255, back (–r) = 35."""
+        t = (depth + r) / (2.0 * r) if r > 0 else 0.5
+        return int(35 + max(0.0, min(1.0, t)) * 220)
+
+    def _draw_orbit_ring(self, p: QPainter, base: QColor) -> None:
+        r = self._dist / 100.0
+        steps = 80
+        for i in range(steps):
+            a1 = 2 * math.pi * i       / steps
+            a2 = 2 * math.pi * (i + 1) / steps
+            x1, z1 = r * math.sin(a1), r * math.cos(a1)
+            x2, z2 = r * math.sin(a2), r * math.cos(a2)
+            depth  = (self._screen_depth(x1, 0, z1) + self._screen_depth(x2, 0, z2)) * 0.5
+            col    = QColor(base)
+            col.setAlpha(self._fog_alpha(depth, r))
+            p.setPen(QPen(col, 1.5))
+            p.drawLine(self._project(x1, 0, z1), self._project(x2, 0, z2))
+
+    def _draw_elevation_arc(self, p: QPainter, base: QColor) -> None:
+        r  = self._dist / 100.0
+        a  = math.radians(self._az)
+        steps = 40
+        for i in range(steps):
+            e1 = math.pi * i       / steps - math.pi / 2
+            e2 = math.pi * (i + 1) / steps - math.pi / 2
+            def pt(e):
+                return (r * math.cos(e) * math.sin(a),
+                        r * math.sin(e),
+                        r * math.cos(e) * math.cos(a))
+            x1, y1, z1 = pt(e1)
+            x2, y2, z2 = pt(e2)
+            depth  = (self._screen_depth(x1, y1, z1) + self._screen_depth(x2, y2, z2)) * 0.5
+            col    = QColor(base)
+            col.setAlpha(self._fog_alpha(depth, r))
+            p.setPen(QPen(col, 1.5))
+            p.drawLine(self._project(x1, y1, z1), self._project(x2, y2, z2))
+
+    def _draw_handles(self, p: QPainter, accent: QColor) -> None:
+        r = float(self._R_HANDLE)
+        p.setPen(QPen(QColor(255, 255, 255, 150), 1))
+        p.setBrush(QBrush(accent))
+        p.drawEllipse(self._pos_el(), r, r)
+
+    # -------------------------------------------------------- mouse events
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.LeftButton:
+            return
+        pos = QPointF(event.pos())
+        best_name, best_d2, best_val = None, self._R_HIT ** 2, 0
+        for name, hpos, val in (
+            ('az', self._pos_az(), self._az),
+            ('el', self._pos_el(), self._el),
+        ):
+            d2 = (pos.x() - hpos.x()) ** 2 + (pos.y() - hpos.y()) ** 2
+            if d2 < best_d2:
+                best_name, best_d2, best_val = name, d2, val
+        if best_name:
+            self._drag            = best_name
+            self._drag_origin     = pos
+            self._drag_start_val  = best_val
+            self.setCursor(Qt.ClosedHandCursor)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag is None:
+            return
+        pos = QPointF(event.pos())
+        dx  = pos.x() - self._drag_origin.x()
+        dy  = pos.y() - self._drag_origin.y()
+
+        if self._drag == 'az':
+            new = max(-180, min(180, int(round(self._drag_start_val + dx))))
+            if self._az != new:
+                self._az = new
+                self.azimuth_changed.emit(new)
+                self.update()
+        elif self._drag == 'el':
+            new = max(-90, min(90, int(round(self._drag_start_val - dy * 0.8))))
+            if self._el != new:
+                self._el = new
+                self.elevation_changed.emit(new)
+                self.update()
+                self.update()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self._drag = None
+            self.setCursor(Qt.ArrowCursor)
 
 
 class DropThumbnail(QLabel):
@@ -564,6 +788,7 @@ class KritaiDocker(DockWidget):
         self._preview.setAlignment(Qt.AlignCenter)
         self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._preview.setStyleSheet("border-radius: 4px;")
+        self._preview.setMaximumHeight(240)
         self._preview.setVisible(False)
         outer.addWidget(self._preview)
 
@@ -822,83 +1047,59 @@ class KritaiDocker(DockWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        # --- Camera controls ---
+        # --- 3-D orbit widget ---
+        self._orbit = CameraOrbitWidget()
+        layout.addWidget(self._orbit)
+
+        # --- Numeric readouts (synced to orbit widget) ---
         cam_form = QFormLayout()
         cam_form.setContentsMargins(0, 0, 0, 0)
         cam_form.setSpacing(4)
         cam_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         cam_form.setHorizontalSpacing(20)
 
-        # Azimuth
-        az_row = QWidget()
-        az_layout = QHBoxLayout(az_row)
-        az_layout.setContentsMargins(0, 0, 0, 0)
-        az_layout.setSpacing(6)
-        self._angle_azimuth = QSlider(Qt.Horizontal)
-        self._angle_azimuth.setRange(0, 315)
-        self._angle_azimuth.setSingleStep(45)
-        self._angle_azimuth.setPageStep(45)
-        self._angle_azimuth.setValue(0)
-        self._angle_azimuth_spin = QSpinBox()
-        self._angle_azimuth_spin.setRange(0, 315)
-        self._angle_azimuth_spin.setSingleStep(45)
-        self._angle_azimuth_spin.setValue(0)
-        self._angle_azimuth_spin.setSuffix("°")
-        self._angle_azimuth_spin.setFixedWidth(70)
-        self._angle_azimuth.valueChanged.connect(self._angle_azimuth_spin.setValue)
-        self._angle_azimuth_spin.valueChanged.connect(self._angle_azimuth.setValue)
-        az_layout.addWidget(self._angle_azimuth)
-        az_layout.addWidget(self._angle_azimuth_spin)
-        az_row.setToolTip("Horizontal rotation around the subject (0° = front).")
+        def _int_slider_row(lo, hi, default, suffix, tooltip):
+            row = QWidget()
+            hl  = QHBoxLayout(row)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(4)
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(lo, hi)
+            slider.setValue(default)
+            slider.setToolTip(tooltip)
+            spin = QSpinBox()
+            spin.setRange(lo, hi)
+            spin.setValue(default)
+            spin.setSuffix(suffix)
+            spin.setFixedWidth(64)
+            spin.setToolTip(tooltip)
+            reset_btn = QToolButton()
+            reset_btn.setIcon(Krita.instance().icon("reload-preset"))
+            reset_btn.setToolTip(f"Reset to default ({default}{suffix})")
+            reset_btn.clicked.connect(lambda: slider.setValue(default))
+            slider.valueChanged.connect(spin.setValue)
+            spin.valueChanged.connect(slider.setValue)
+            hl.addWidget(slider)
+            hl.addWidget(spin)
+            hl.addWidget(reset_btn)
+            return row, slider
+
+        az_row, self._angle_azimuth = _int_slider_row(
+            -180, 180, 0, "°", "Horizontal rotation around the subject (0° = front).")
+        self._angle_azimuth.valueChanged.connect(self._orbit.setAzimuth)
+        self._orbit.azimuth_changed.connect(self._angle_azimuth.setValue)
         cam_form.addRow("Azimuth", az_row)
 
-        # Elevation
-        el_row = QWidget()
-        el_layout = QHBoxLayout(el_row)
-        el_layout.setContentsMargins(0, 0, 0, 0)
-        el_layout.setSpacing(6)
-        self._angle_elevation = QSlider(Qt.Horizontal)
-        self._angle_elevation.setRange(-30, 60)
-        self._angle_elevation.setSingleStep(30)
-        self._angle_elevation.setPageStep(30)
-        self._angle_elevation.setValue(0)
-        self._angle_elevation_spin = QSpinBox()
-        self._angle_elevation_spin.setRange(-30, 60)
-        self._angle_elevation_spin.setSingleStep(30)
-        self._angle_elevation_spin.setValue(0)
-        self._angle_elevation_spin.setSuffix("°")
-        self._angle_elevation_spin.setFixedWidth(70)
-        self._angle_elevation.valueChanged.connect(self._angle_elevation_spin.setValue)
-        self._angle_elevation_spin.valueChanged.connect(self._angle_elevation.setValue)
-        el_layout.addWidget(self._angle_elevation)
-        el_layout.addWidget(self._angle_elevation_spin)
-        el_row.setToolTip("Vertical angle (-30° = low, 0° = eye-level, 60° = high).")
+        el_row, self._angle_elevation = _int_slider_row(
+            -90, 90, 0, "°", "Vertical angle (−90° = bottom, 0° = eye-level, 90° = top).")
+        self._angle_elevation.valueChanged.connect(self._orbit.setElevation)
+        self._orbit.elevation_changed.connect(self._angle_elevation.setValue)
         cam_form.addRow("Elevation", el_row)
 
-        # Distance
-        dist_row = QWidget()
-        dist_layout = QHBoxLayout(dist_row)
-        dist_layout.setContentsMargins(0, 0, 0, 0)
-        dist_layout.setSpacing(6)
-        self._angle_distance = QSlider(Qt.Horizontal)
-        self._angle_distance.setRange(60, 180)
-        self._angle_distance.setSingleStep(10)
-        self._angle_distance.setValue(100)
-        self._angle_distance_spin = QDoubleSpinBox()
-        self._angle_distance_spin.setRange(0.6, 1.8)
-        self._angle_distance_spin.setSingleStep(0.1)
-        self._angle_distance_spin.setDecimals(1)
-        self._angle_distance_spin.setValue(1.0)
-        self._angle_distance_spin.setFixedWidth(70)
-        self._angle_distance.valueChanged.connect(
-            lambda v: self._angle_distance_spin.setValue(v / 100)
-        )
-        self._angle_distance_spin.valueChanged.connect(
-            lambda v: self._angle_distance.setValue(int(v * 100))
-        )
-        dist_layout.addWidget(self._angle_distance)
-        dist_layout.addWidget(self._angle_distance_spin)
-        dist_row.setToolTip("Camera distance (0.6 = close-up, 1.0 = medium, 1.8 = wide).")
+        dist_row, self._angle_distance = _int_slider_row(
+            60, 180, 100, "", "Camera distance (60 = close-up, 100 = medium, 180 = wide).")
+        self._angle_distance.valueChanged.connect(self._orbit.setDistance)
+        self._orbit.distance_changed.connect(self._angle_distance.setValue)
         cam_form.addRow("Distance", dist_row)
 
         layout.addLayout(cam_form)
@@ -908,7 +1109,7 @@ class KritaiDocker(DockWidget):
         preset_row.setSpacing(4)
         for name, (az, el, dist) in ANGLE_PRESETS.items():
             btn = QPushButton(name)
-            btn.setToolTip(f"Azimuth {az}°, Elevation {el}°, Distance {dist / 100:.1f}")
+            btn.setToolTip(f"Azimuth {az}°, Elevation {el}°, Distance {dist}")
             btn.clicked.connect(lambda checked=False, a=az, e=el, d=dist: self._apply_angle_preset(a, e, d))
             preset_row.addWidget(btn)
         layout.addLayout(preset_row)
@@ -930,7 +1131,7 @@ class KritaiDocker(DockWidget):
 
         self._angle_steps = QSpinBox()
         self._angle_steps.setRange(1, 100)
-        self._angle_steps.setValue(20)
+        self._angle_steps.setValue(4)
         self._angle_steps.setToolTip("Number of denoising steps.")
         form.addRow("Steps", self._angle_steps)
 
@@ -1041,22 +1242,12 @@ class KritaiDocker(DockWidget):
         az_desc = _snap_to_nearest_wrap(self._angle_azimuth.value(), AZIMUTH_MAP)
         el_desc = _snap_to_nearest(self._angle_elevation.value(), ELEVATION_MAP)
         dist_desc = _snap_to_nearest(self._angle_distance.value(), DISTANCE_MAP)
-        return f"{ANGLE_TRIGGER_TOKEN} {az_desc}, {el_desc}, {dist_desc}"
+        return f"{az_desc}, {el_desc}, {dist_desc}"
 
     def _apply_angle_preset(self, azimuth: int, elevation: int, distance: int) -> None:
-        self._angle_azimuth.blockSignals(True)
-        self._angle_elevation.blockSignals(True)
-        self._angle_distance.blockSignals(True)
         self._angle_azimuth.setValue(azimuth)
         self._angle_elevation.setValue(elevation)
         self._angle_distance.setValue(distance)
-        self._angle_azimuth.blockSignals(False)
-        self._angle_elevation.blockSignals(False)
-        self._angle_distance.blockSignals(False)
-        # Sync spin boxes.
-        self._angle_azimuth_spin.setValue(azimuth)
-        self._angle_elevation_spin.setValue(elevation)
-        self._angle_distance_spin.setValue(distance / 100)
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -1268,7 +1459,7 @@ class KritaiDocker(DockWidget):
             self._edit_quantize, self._edit_steps, self._edit_guidance,
             self._edit_strength, self._edit_scale, self._edit_seed, self._edit_random_seed,
             self._angle_azimuth, self._angle_elevation, self._angle_distance,
-            self._angle_quantize, self._angle_steps,
+            self._orbit, self._angle_quantize, self._angle_steps,
             self._angle_scale, self._angle_seed, self._angle_random_seed,
             self._tabs,
         ]
@@ -1339,15 +1530,17 @@ class KritaiDocker(DockWidget):
 
         # --- Restore Angle tab ---
         angle = data.get("angle", {})
-        self._angle_azimuth.setValue(angle.get("azimuth", 0))
-        self._angle_azimuth_spin.setValue(angle.get("azimuth", 0))
-        self._angle_elevation.setValue(angle.get("elevation", 0))
-        self._angle_elevation_spin.setValue(angle.get("elevation", 0))
+        az = angle.get("azimuth", 0)
+        el = angle.get("elevation", 0)
         dv = angle.get("distance", 100)
+        self._angle_azimuth.setValue(az)
+        self._angle_elevation.setValue(el)
         self._angle_distance.setValue(dv)
-        self._angle_distance_spin.setValue(dv / 100)
+        self._orbit.setAzimuth(az)
+        self._orbit.setElevation(el)
+        self._orbit.setDistance(dv)
         self._angle_quantize.setValue(angle.get("quantize", 4))
-        self._angle_steps.setValue(angle.get("steps", 20))
+        self._angle_steps.setValue(angle.get("steps", 4))
         ascv = int(angle.get("scale", 0.5) * 100)
         self._angle_scale.setValue(ascv)
         self._angle_scale_spin.setValue(ascv / 100)
@@ -1657,8 +1850,8 @@ class KritaiDocker(DockWidget):
             cmd += ["--quantize", str(self._angle_quantize.value())]
         if not self._angle_random_seed.isChecked():
             cmd += ["--seed", str(self._angle_seed.value())]
-        # Append angle LoRA.
-        cmd += ["--lora-paths", ANGLE_LORA_REPO, "--lora-scales", "1.0"]
+        # Append angle LoRAs: lightning speed + multi-angle.
+        cmd += ["--lora-paths"] + ANGLE_LORA_PATHS + ["--lora-scales"] + ANGLE_LORA_SCALES
         return cmd
 
     def _build_edit_prompt(self) -> str:
