@@ -43,6 +43,7 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSpacerItem,
     QSpinBox,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -60,10 +61,40 @@ MODEL_CLI = {
     "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True,  False),
     "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
     # FLUX.2 edit — canvas + optional reference image via --image-paths
-    "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, False, True),
+    "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, True,  True),
     # Kontext (image editing via instruction)
     "kontext-dev":         ("mflux-generate-kontext",     "dev",                True,  True,  False),
     "kontext-schnell":     ("mflux-generate-kontext",     "schnell",            True,  False, False),
+}
+
+# Which models belong to which tab.
+GENERATE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
+EDIT_MODELS = ["flux2-edit", "kontext-dev", "kontext-schnell"]
+
+# Angle LoRA configuration.
+ANGLE_LORA_REPO = "fal/Qwen-Image-Edit-2511-Multiple-Angles-LoRA"
+ANGLE_TRIGGER_TOKEN = "<sks>"
+
+AZIMUTH_MAP = [
+    (0, "front view"), (45, "front-right quarter view"),
+    (90, "right side view"), (135, "back-right quarter view"),
+    (180, "back view"), (225, "back-left quarter view"),
+    (270, "left side view"), (315, "front-left quarter view"),
+]
+ELEVATION_MAP = [
+    (-30, "low-angle shot"), (0, "eye-level shot"),
+    (30, "elevated shot"), (60, "high-angle shot"),
+]
+DISTANCE_MAP = [
+    (60, "close-up"), (100, "medium shot"), (180, "wide shot"),
+]
+ANGLE_PRESETS = {
+    "Front":  (0, 0, 100),
+    "Right":  (90, 0, 100),
+    "Back":   (180, 0, 100),
+    "Left":   (270, 0, 100),
+    "Top":    (0, 60, 100),
+    "Low":    (0, -30, 100),
 }
 
 # How often (ms) to poll canvas for changes when auto-mode is on.
@@ -129,6 +160,40 @@ class PreviewLabel(QLabel):
             x = (self.width() - scaled.width()) // 2
             y = (self.height() - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
+
+
+class _AdaptiveTabWidget(QTabWidget):
+    """QTabWidget whose height tracks the active tab only.
+
+    The standard QTabWidget reports a sizeHint tall enough to fit every tab,
+    which causes the panel to be unnecessarily tall when a shorter tab is
+    selected.  We only override the *height* — width is left to the base class
+    so the docker retains its normal minimum/preferred width.  Callers must
+    invoke updateGeometry() after switching tabs so the parent layout reflows.
+    """
+
+    def sizeHint(self) -> QSize:
+        base = super().sizeHint()
+        return QSize(base.width(), self._preferred_height())
+
+    def minimumSizeHint(self) -> QSize:
+        base = super().minimumSizeHint()
+        w = self.currentWidget()
+        if w is None:
+            return base
+        tab_bar_h = self.tabBar().sizeHint().height()
+        margins = self.contentsMargins()
+        min_h = w.minimumSizeHint().height() + tab_bar_h + margins.top() + margins.bottom() + 4
+        return QSize(base.width(), max(min_h, tab_bar_h + 20))
+
+    def _preferred_height(self) -> int:
+        w = self.currentWidget()
+        if w is None:
+            return super().sizeHint().height()
+        tab_bar_h = self.tabBar().sizeHint().height()
+        margins = self.contentsMargins()
+        extra = tab_bar_h + margins.top() + margins.bottom() + 4
+        return max(w.sizeHint().height() + extra, tab_bar_h + 20)
 
 
 class DropThumbnail(QLabel):
@@ -322,6 +387,22 @@ class _FocusOutSignal(QObject):
         return False
 
 
+# ======================================================================
+# Helpers to snap continuous angle values to the nearest discrete option.
+# ======================================================================
+
+def _snap_to_nearest(value: int, mapping: list[tuple[int, str]]) -> str:
+    """Return the description for the nearest key in *mapping*."""
+    return min(mapping, key=lambda kv: abs(value - kv[0]))[1]
+
+
+def _snap_to_nearest_wrap(value: int, mapping: list[tuple[int, str]], wrap: int = 360) -> str:
+    """Return the description for the nearest key, wrapping around *wrap*."""
+    def dist(kv):
+        return min(abs(value - kv[0]), wrap - abs(value - kv[0]))
+    return min(mapping, key=dist)[1]
+
+
 class KritaiDocker(DockWidget):
 
     def __init__(self) -> None:
@@ -372,235 +453,18 @@ class KritaiDocker(DockWidget):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
 
-        # --- Model selector ---
-        self._model = QComboBox()
-        # Groups mirror the model families in the mflux README.
-        # SeedVR2 (upscaling) and Depth Pro (depth estimation) are omitted
-        # as they are not image-to-image generation models.
-        model_tooltips = {
-            "flux2-klein-4b":      "Fast distilled 4B model. Good default for quick iterations. No guidance.",
-            "flux2-klein-9b":      "Distilled 9B model. Higher quality than 4B but slower. No guidance.",
-            "flux2-klein-base-4b": "Non-distilled 4B base model. Supports guidance. Needs more steps.",
-            "flux2-klein-base-9b": "Non-distilled 9B base model. Best quality in the FLUX.2 family.",
-            "flux2-edit":          "Edit the canvas with a prompt and an optional reference image.",
-            "kontext-dev":         "High-quality instruction-based image editing.",
-            "kontext-schnell":     "Faster distilled variant. No guidance.",
-        }
-        model_groups = {
-            "FLUX.2 (recommended)": [
-                "flux2-klein-4b",
-                "flux2-klein-9b",
-                "flux2-klein-base-4b",
-                "flux2-klein-base-9b",
-                "flux2-edit",
-            ],
-            "Kontext": [
-                "kontext-dev",
-                "kontext-schnell",
-            ],
-        }
-        for group, models in model_groups.items():
-            self._model.insertSeparator(self._model.count())
-            # Qt doesn't have native group headers; use a disabled item as label.
-            self._model.addItem(group)
-            self._model.model().item(self._model.count() - 1).setEnabled(False)
-            for m in models:
-                self._model.addItem(m)
-                idx = self._model.count() - 1
-                self._model.setItemData(idx, model_tooltips.get(m, ""), Qt.ToolTipRole)
-        self._model.setCurrentIndex(self._model.findText("flux2-klein-4b"))
-        self._model.setToolTip(
-            "Which mflux model family to use for generation.\n"
-            "FLUX.2 is the fastest and highest quality.\n"
-            "Kontext offers instruction-based editing."
-        )
-        self._model.currentIndexChanged.connect(self._update_model_ui)
-        # --- Prompt ---
-        self._prompt = QPlainTextEdit()
-        self._prompt.setPlaceholderText("Prompt...")
-        self._prompt.setToolTip("Describe what you want the image to look like.")
-        self._prompt.setFixedHeight(60)
-        outer.addWidget(self._prompt)
-
-        # --- Negative prompt ---
-        self._negative_prompt = QLineEdit()
-        self._negative_prompt.setPlaceholderText("Optional negative prompt…")
-        self._negative_prompt.setToolTip(
-            "Describe what you want to avoid in the result.\n"
-            "Example: blurry, low quality, extra limbs."
-        )
-        self._negative_prompt.setVisible(False)
-        outer.addWidget(self._negative_prompt)
-
-        # --- Settings ---
-        settings_widget = QWidget()
-        form = QFormLayout(settings_widget)
-        form.setContentsMargins(0, 0, 0, 0)
-        form.setSpacing(4)
-        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        form.setHorizontalSpacing(20)
-        outer.addWidget(settings_widget)
-
-        form.addRow("Model", self._model)
-
-        self._quantize = QSpinBox()
-        self._quantize.setSpecialValueText("None")
-        self._quantize.setRange(0, 8)
-        self._quantize.setValue(4)
-        self._quantize.setToolTip(
-            "Reduces model weight precision to save memory and speed up generation.\n"
-            "4 is a good balance of quality and speed.\n"
-            "Higher = better quality, more RAM. 0 = no quantization (full precision)."
-        )
-        form.addRow("Quantize", self._quantize)
-
-        self._steps = QSpinBox()
-        self._steps.setRange(1, 100)
-        self._steps.setValue(20)
-        self._steps.setToolTip(
-            "Number of denoising steps. More steps = higher quality but slower.\n"
-            "Distilled models (schnell, klein, turbo) work well with 4–8 steps.\n"
-            "Base models (dev, base) typically need 20–50 steps."
-        )
-        form.addRow("Steps", self._steps)
-
-        self._guidance = QDoubleSpinBox()
-        self._guidance.setRange(0.0, 30.0)
-        self._guidance.setSingleStep(0.5)
-        self._guidance.setValue(3.5)
-        self._guidance.setToolTip(
-            "How closely the result follows your prompt.\n"
-            "Higher = more literal, lower = more creative.\n"
-            "Not supported by distilled models (they ignore this setting)."
-        )
-        form.addRow("Guidance", self._guidance)
-        self._guidance_label = form.labelForField(self._guidance)
-
-        strength_row = QWidget()
-        strength_layout = QHBoxLayout(strength_row)
-        strength_layout.setContentsMargins(0, 0, 0, 0)
-        strength_layout.setSpacing(6)
-        self._strength = QSlider(Qt.Horizontal)
-        self._strength.setRange(0, 100)
-        self._strength.setValue(75)
-        self._strength_spin = QDoubleSpinBox()
-        self._strength_spin.setRange(0.0, 1.0)
-        self._strength_spin.setSingleStep(0.01)
-        self._strength_spin.setDecimals(2)
-        self._strength_spin.setValue(self._strength.value() / 100)
-        self._strength_spin.setFixedWidth(60)
-        self._strength.valueChanged.connect(
-            lambda v: self._strength_spin.setValue(v / 100)
-        )
-        self._strength_spin.valueChanged.connect(
-            lambda v: self._strength.setValue(int(v * 100))
-        )
-        strength_layout.addWidget(self._strength)
-        strength_layout.addWidget(self._strength_spin)
-        strength_row.setToolTip(
-            "How much the canvas influences the result.\n"
-            "0.0 = output ignores your painting entirely.\n"
-            "1.0 = output stays very close to the canvas.\n"
-            "0.5–0.7 is a good starting range."
-        )
-        form.addRow("Strength", strength_row)
-        self._strength_row = strength_row
-        self._strength_label_form = form.labelForField(strength_row)
-
-        scale_row = QWidget()
-        scale_layout = QHBoxLayout(scale_row)
-        scale_layout.setContentsMargins(0, 0, 0, 0)
-        scale_layout.setSpacing(6)
-        self._scale = QSlider(Qt.Horizontal)
-        self._scale.setRange(0, 100)
-        self._scale.setValue(50)
-        self._scale_spin = QDoubleSpinBox()
-        self._scale_spin.setRange(0.0, 1.0)
-        self._scale_spin.setSingleStep(0.01)
-        self._scale_spin.setDecimals(2)
-        self._scale_spin.setValue(self._scale.value() / 100)
-        self._scale_spin.setFixedWidth(60)
-        self._scale.valueChanged.connect(
-            lambda v: self._scale_spin.setValue(v / 100)
-        )
-        self._scale_spin.valueChanged.connect(
-            lambda v: self._scale.setValue(int(v * 100))
-        )
-
-        scale_layout.addWidget(self._scale)
-        scale_layout.addWidget(self._scale_spin)
-        scale_row.setToolTip(
-            "Scale of the canvas sent to mflux relative to its original size.\n"
-            "0.5 = half resolution (faster, less VRAM).\n"
-            "1.0 = full resolution."
-        )
-        form.addRow("Scale", scale_row)
-
-        seed_row = QWidget()
-        seed_layout = QHBoxLayout(seed_row)
-        seed_layout.setContentsMargins(0, 0, 0, 0)
-        self._seed = QSpinBox()
-        self._seed.setRange(0, 2_000_000_000)
-        self._seed.setValue(0)
-        self._random_seed = QCheckBox("Random")
-        self._random_seed.setChecked(False)
-        self._random_seed.toggled.connect(self._seed.setDisabled)
-        self._seed.setDisabled(False)
-        seed_layout.addWidget(self._seed)
-        seed_layout.addWidget(self._random_seed)
-        seed_row.setToolTip(
-            "Fixed seed produces the same result every time given the same inputs.\n"
-            "Random seed gives a different result on each generation."
-        )
-        form.addRow("Seed", seed_row)
-
-        # --- Reference images (edit models only) ---
-        self._ref_section = CollapsibleSection("Reference Images")
-        ref_content = QVBoxLayout()
-        ref_content.setSpacing(4)
-
-        self._ref_list = QVBoxLayout()
-        self._ref_list.setSpacing(4)
-        ref_content.addLayout(self._ref_list)
-        self._ref_entries = []  # list of (thumbnail, prompt_edit, row_widget)
-
-        add_ref_btn = QToolButton()
-        add_ref_btn.setIcon(Krita.instance().icon("list-add"))
-        add_ref_btn.setToolTip("Add reference image")
-        add_ref_btn.clicked.connect(lambda: self._add_ref_row())
-        ref_content.addWidget(add_ref_btn)
-
-        self._ref_section.setContentLayout(ref_content)
-        self._ref_section.setVisible(False)
-        outer.addWidget(self._ref_section)
-
-        # --- LoRA list ---
-        lora_section = CollapsibleSection("LoRAs")
-        lora_content = QVBoxLayout()
-        lora_content.setSpacing(4)
-
-        self._lora_list = QVBoxLayout()
-        self._lora_list.setSpacing(4)
-        lora_content.addLayout(self._lora_list)
-        self._lora_entries = []  # list of (path_widget, scale_widget, row_widget)
-
-        add_lora_btn = QToolButton()
-        add_lora_btn.setIcon(Krita.instance().icon("list-add"))
-        add_lora_btn.setToolTip("Add LoRA")
-        add_lora_btn.clicked.connect(lambda: self._add_lora_row())
-        lora_content.addWidget(add_lora_btn)
-
-        lora_section.setContentLayout(lora_content)
-        outer.addWidget(lora_section)
+        # --- Tab widget ---
+        self._tabs = _AdaptiveTabWidget()
+        self._tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._tabs.addTab(self._build_generate_tab(), "Generate")
+        self._tabs.addTab(self._build_edit_tab(), "Edit")
+        self._tabs.addTab(self._build_angle_tab(), "Frame")
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+        outer.addWidget(self._tabs)
 
         # --- Buttons ---
         btn_row = QHBoxLayout()
         outer.addLayout(btn_row)
-
-        sep_bottom = QFrame()
-        sep_bottom.setFrameShape(QFrame.HLine)
-        sep_bottom.setFrameShadow(QFrame.Sunken)
-        outer.addWidget(sep_bottom)
 
         self._auto_btn = QToolButton()
         self._auto_btn.setCheckable(True)
@@ -679,17 +543,26 @@ class KritaiDocker(DockWidget):
         self._log.setVisible(False)
         self._log.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
 
+        self._log_btns = QWidget()
+        self._log_btns.setVisible(False)
+        log_btns_layout = QHBoxLayout(self._log_btns)
+        log_btns_layout.setContentsMargins(0, 0, 0, 0)
+        log_btns_layout.setSpacing(4)
+        self._copy_log_btn = QPushButton("Copy")
+        self._copy_log_btn.clicked.connect(self._copy_log)
         self._clear_btn = QPushButton("Clear")
-        self._clear_btn.setVisible(False)
         self._clear_btn.clicked.connect(self._clear_log)
+        log_btns_layout.addWidget(self._copy_log_btn)
+        log_btns_layout.addWidget(self._clear_btn)
+        log_btns_layout.addStretch()
 
         outer.addWidget(self._log)
-        outer.addWidget(self._clear_btn)
+        outer.addWidget(self._log_btns)
 
         # --- Preview image ---
         self._preview = PreviewLabel()
         self._preview.setAlignment(Qt.AlignCenter)
-        self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._preview.setStyleSheet("border-radius: 4px;")
         self._preview.setVisible(False)
         outer.addWidget(self._preview)
@@ -700,10 +573,490 @@ class KritaiDocker(DockWidget):
         self._time_label.setVisible(False)
         outer.addWidget(self._time_label)
 
-        outer.addItem(QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding))
+        outer.addStretch()
 
-        self._update_model_ui()
-        self._prompt.textChanged.connect(self._update_generate_btn)
+        self._update_generate_btn()
+
+    # ------------------------------------------------------------------
+    # Tab builders
+    # ------------------------------------------------------------------
+
+    def _build_generate_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        # --- Model selector ---
+        self._gen_model = QComboBox()
+        model_tooltips = {
+            "flux2-klein-4b":      "Fast distilled 4B model. Good default for quick iterations. No guidance.",
+            "flux2-klein-9b":      "Distilled 9B model. Higher quality than 4B but slower. No guidance.",
+            "flux2-klein-base-4b": "Non-distilled 4B base model. Supports guidance. Needs more steps.",
+            "flux2-klein-base-9b": "Non-distilled 9B base model. Best quality in the FLUX.2 family.",
+        }
+        for m in GENERATE_MODELS:
+            self._gen_model.addItem(m)
+            idx = self._gen_model.count() - 1
+            self._gen_model.setItemData(idx, model_tooltips.get(m, ""), Qt.ToolTipRole)
+        self._gen_model.setCurrentIndex(0)
+        self._gen_model.currentIndexChanged.connect(self._update_generate_tab_ui)
+
+        # --- Prompt ---
+        self._gen_prompt = QPlainTextEdit()
+        self._gen_prompt.setPlaceholderText("Prompt...")
+        self._gen_prompt.setToolTip("Describe what you want the image to look like.")
+        self._gen_prompt.setFixedHeight(60)
+
+
+        # --- Settings form ---
+        settings_widget = QWidget()
+        form = QFormLayout(settings_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setHorizontalSpacing(20)
+
+        form.addRow("Model", self._gen_model)
+
+        self._gen_quantize = QSpinBox()
+        self._gen_quantize.setSpecialValueText("None")
+        self._gen_quantize.setRange(0, 8)
+        self._gen_quantize.setValue(4)
+        self._gen_quantize.setToolTip(
+            "Reduces model weight precision to save memory and speed up generation.\n"
+            "4 is a good balance of quality and speed.\n"
+            "Higher = better quality, more RAM. 0 = no quantization (full precision)."
+        )
+        form.addRow("Quantize", self._gen_quantize)
+
+        self._gen_steps = QSpinBox()
+        self._gen_steps.setRange(1, 100)
+        self._gen_steps.setValue(20)
+        self._gen_steps.setToolTip(
+            "Number of denoising steps. More steps = higher quality but slower.\n"
+            "Distilled models (klein) work well with 4–8 steps.\n"
+            "Base models need 20–50 steps."
+        )
+        form.addRow("Steps", self._gen_steps)
+
+        self._gen_guidance = QDoubleSpinBox()
+        self._gen_guidance.setRange(0.0, 30.0)
+        self._gen_guidance.setSingleStep(0.5)
+        self._gen_guidance.setValue(3.5)
+        self._gen_guidance.setToolTip(
+            "How closely the result follows your prompt.\n"
+            "Higher = more literal, lower = more creative.\n"
+            "Not supported by distilled models."
+        )
+        form.addRow("Guidance", self._gen_guidance)
+        self._gen_guidance_label = form.labelForField(self._gen_guidance)
+
+        strength_row, self._gen_strength, self._gen_strength_spin = self._make_slider_row(
+            0, 100, 75, "How much the canvas influences the result.\n"
+            "0.0 = output ignores your painting entirely.\n"
+            "1.0 = output stays very close to the canvas.\n"
+            "0.5–0.7 is a good starting range."
+        )
+        form.addRow("Strength", strength_row)
+        self._gen_strength_row = strength_row
+        self._gen_strength_label = form.labelForField(strength_row)
+
+        scale_row, self._gen_scale, self._gen_scale_spin = self._make_slider_row(
+            0, 100, 50, "Scale of the canvas sent to mflux relative to its original size.\n"
+            "0.5 = half resolution (faster, less VRAM).\n"
+            "1.0 = full resolution."
+        )
+        form.addRow("Scale", scale_row)
+
+        seed_row, self._gen_seed, self._gen_random_seed = self._make_seed_row()
+        form.addRow("Seed", seed_row)
+
+        layout.addWidget(self._gen_prompt)
+        layout.addWidget(settings_widget)
+
+        # --- LoRA section ---
+        gen_lora_section = CollapsibleSection("LoRAs")
+        gen_lora_content = QVBoxLayout()
+        gen_lora_content.setSpacing(4)
+        self._gen_lora_list = QVBoxLayout()
+        self._gen_lora_list.setSpacing(4)
+        gen_lora_content.addLayout(self._gen_lora_list)
+        self._gen_lora_entries: list[tuple] = []
+
+        add_lora_btn = QToolButton()
+        add_lora_btn.setIcon(Krita.instance().icon("list-add"))
+        add_lora_btn.setToolTip("Add LoRA")
+        add_lora_btn.clicked.connect(lambda: self._add_lora_row(self._gen_lora_entries, self._gen_lora_list))
+        gen_lora_content.addWidget(add_lora_btn)
+        gen_lora_section.setContentLayout(gen_lora_content)
+        layout.addWidget(gen_lora_section)
+
+        layout.addStretch()
+        content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self._update_generate_tab_ui()
+        return content
+
+    def _build_edit_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        # --- Model selector ---
+        self._edit_model = QComboBox()
+        model_tooltips = {
+            "flux2-edit":      "Edit the canvas with a prompt and an optional reference image.",
+            "kontext-dev":     "High-quality instruction-based image editing.",
+            "kontext-schnell": "Faster distilled variant. No guidance.",
+        }
+        for m in EDIT_MODELS:
+            self._edit_model.addItem(m)
+            idx = self._edit_model.count() - 1
+            self._edit_model.setItemData(idx, model_tooltips.get(m, ""), Qt.ToolTipRole)
+        self._edit_model.setCurrentIndex(0)
+        self._edit_model.currentIndexChanged.connect(self._update_edit_tab_ui)
+
+        # --- Prompt ---
+        self._edit_prompt = QPlainTextEdit()
+        self._edit_prompt.setPlaceholderText("Prompt...")
+        self._edit_prompt.setToolTip("Describe what you want to change in the image.")
+        self._edit_prompt.setFixedHeight(60)
+
+
+        # --- Settings form ---
+        settings_widget = QWidget()
+        form = QFormLayout(settings_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setHorizontalSpacing(20)
+
+        form.addRow("Model", self._edit_model)
+
+        self._edit_quantize = QSpinBox()
+        self._edit_quantize.setSpecialValueText("None")
+        self._edit_quantize.setRange(0, 8)
+        self._edit_quantize.setValue(4)
+        self._edit_quantize.setToolTip(
+            "Reduces model weight precision to save memory and speed up generation.\n"
+            "4 is a good balance of quality and speed."
+        )
+        form.addRow("Quantize", self._edit_quantize)
+
+        self._edit_steps = QSpinBox()
+        self._edit_steps.setRange(1, 100)
+        self._edit_steps.setValue(20)
+        self._edit_steps.setToolTip("Number of denoising steps.")
+        form.addRow("Steps", self._edit_steps)
+
+        self._edit_guidance = QDoubleSpinBox()
+        self._edit_guidance.setRange(0.0, 30.0)
+        self._edit_guidance.setSingleStep(0.5)
+        self._edit_guidance.setValue(3.5)
+        self._edit_guidance.setToolTip("How closely the result follows your prompt.")
+        form.addRow("Guidance", self._edit_guidance)
+        self._edit_guidance_label = form.labelForField(self._edit_guidance)
+
+        strength_row, self._edit_strength, self._edit_strength_spin = self._make_slider_row(
+            0, 100, 75, "How much the canvas influences the result."
+        )
+        form.addRow("Strength", strength_row)
+        self._edit_strength_row = strength_row
+        self._edit_strength_label = form.labelForField(strength_row)
+
+        scale_row, self._edit_scale, self._edit_scale_spin = self._make_slider_row(
+            0, 100, 50, "Scale of the canvas sent to mflux relative to its original size."
+        )
+        form.addRow("Scale", scale_row)
+
+        seed_row, self._edit_seed, self._edit_random_seed = self._make_seed_row()
+        form.addRow("Seed", seed_row)
+
+        layout.addWidget(self._edit_prompt)
+        layout.addWidget(settings_widget)
+
+        # --- Reference images (flux2-edit only) ---
+        self._edit_ref_section = CollapsibleSection("Reference Images")
+        ref_content = QVBoxLayout()
+        ref_content.setSpacing(4)
+        self._edit_ref_list = QVBoxLayout()
+        self._edit_ref_list.setSpacing(4)
+        ref_content.addLayout(self._edit_ref_list)
+        self._edit_ref_entries: list[tuple] = []
+
+        add_ref_btn = QToolButton()
+        add_ref_btn.setIcon(Krita.instance().icon("list-add"))
+        add_ref_btn.setToolTip("Add reference image")
+        add_ref_btn.clicked.connect(lambda: self._add_ref_row(self._edit_ref_entries, self._edit_ref_list))
+        ref_content.addWidget(add_ref_btn)
+        self._edit_ref_section.setContentLayout(ref_content)
+        self._edit_ref_section.setVisible(False)
+        layout.addWidget(self._edit_ref_section)
+
+        # --- LoRA section ---
+        edit_lora_section = CollapsibleSection("LoRAs")
+        edit_lora_content = QVBoxLayout()
+        edit_lora_content.setSpacing(4)
+        self._edit_lora_list = QVBoxLayout()
+        self._edit_lora_list.setSpacing(4)
+        edit_lora_content.addLayout(self._edit_lora_list)
+        self._edit_lora_entries: list[tuple] = []
+
+        add_lora_btn = QToolButton()
+        add_lora_btn.setIcon(Krita.instance().icon("list-add"))
+        add_lora_btn.setToolTip("Add LoRA")
+        add_lora_btn.clicked.connect(lambda: self._add_lora_row(self._edit_lora_entries, self._edit_lora_list))
+        edit_lora_content.addWidget(add_lora_btn)
+        edit_lora_section.setContentLayout(edit_lora_content)
+        layout.addWidget(edit_lora_section)
+
+        layout.addStretch()
+        content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self._update_edit_tab_ui()
+        return content
+
+    def _build_angle_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        # --- Camera controls ---
+        cam_form = QFormLayout()
+        cam_form.setContentsMargins(0, 0, 0, 0)
+        cam_form.setSpacing(4)
+        cam_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        cam_form.setHorizontalSpacing(20)
+
+        # Azimuth
+        az_row = QWidget()
+        az_layout = QHBoxLayout(az_row)
+        az_layout.setContentsMargins(0, 0, 0, 0)
+        az_layout.setSpacing(6)
+        self._angle_azimuth = QSlider(Qt.Horizontal)
+        self._angle_azimuth.setRange(0, 315)
+        self._angle_azimuth.setSingleStep(45)
+        self._angle_azimuth.setPageStep(45)
+        self._angle_azimuth.setValue(0)
+        self._angle_azimuth_spin = QSpinBox()
+        self._angle_azimuth_spin.setRange(0, 315)
+        self._angle_azimuth_spin.setSingleStep(45)
+        self._angle_azimuth_spin.setValue(0)
+        self._angle_azimuth_spin.setSuffix("°")
+        self._angle_azimuth_spin.setFixedWidth(70)
+        self._angle_azimuth.valueChanged.connect(self._angle_azimuth_spin.setValue)
+        self._angle_azimuth_spin.valueChanged.connect(self._angle_azimuth.setValue)
+        az_layout.addWidget(self._angle_azimuth)
+        az_layout.addWidget(self._angle_azimuth_spin)
+        az_row.setToolTip("Horizontal rotation around the subject (0° = front).")
+        cam_form.addRow("Azimuth", az_row)
+
+        # Elevation
+        el_row = QWidget()
+        el_layout = QHBoxLayout(el_row)
+        el_layout.setContentsMargins(0, 0, 0, 0)
+        el_layout.setSpacing(6)
+        self._angle_elevation = QSlider(Qt.Horizontal)
+        self._angle_elevation.setRange(-30, 60)
+        self._angle_elevation.setSingleStep(30)
+        self._angle_elevation.setPageStep(30)
+        self._angle_elevation.setValue(0)
+        self._angle_elevation_spin = QSpinBox()
+        self._angle_elevation_spin.setRange(-30, 60)
+        self._angle_elevation_spin.setSingleStep(30)
+        self._angle_elevation_spin.setValue(0)
+        self._angle_elevation_spin.setSuffix("°")
+        self._angle_elevation_spin.setFixedWidth(70)
+        self._angle_elevation.valueChanged.connect(self._angle_elevation_spin.setValue)
+        self._angle_elevation_spin.valueChanged.connect(self._angle_elevation.setValue)
+        el_layout.addWidget(self._angle_elevation)
+        el_layout.addWidget(self._angle_elevation_spin)
+        el_row.setToolTip("Vertical angle (-30° = low, 0° = eye-level, 60° = high).")
+        cam_form.addRow("Elevation", el_row)
+
+        # Distance
+        dist_row = QWidget()
+        dist_layout = QHBoxLayout(dist_row)
+        dist_layout.setContentsMargins(0, 0, 0, 0)
+        dist_layout.setSpacing(6)
+        self._angle_distance = QSlider(Qt.Horizontal)
+        self._angle_distance.setRange(60, 180)
+        self._angle_distance.setSingleStep(10)
+        self._angle_distance.setValue(100)
+        self._angle_distance_spin = QDoubleSpinBox()
+        self._angle_distance_spin.setRange(0.6, 1.8)
+        self._angle_distance_spin.setSingleStep(0.1)
+        self._angle_distance_spin.setDecimals(1)
+        self._angle_distance_spin.setValue(1.0)
+        self._angle_distance_spin.setFixedWidth(70)
+        self._angle_distance.valueChanged.connect(
+            lambda v: self._angle_distance_spin.setValue(v / 100)
+        )
+        self._angle_distance_spin.valueChanged.connect(
+            lambda v: self._angle_distance.setValue(int(v * 100))
+        )
+        dist_layout.addWidget(self._angle_distance)
+        dist_layout.addWidget(self._angle_distance_spin)
+        dist_row.setToolTip("Camera distance (0.6 = close-up, 1.0 = medium, 1.8 = wide).")
+        cam_form.addRow("Distance", dist_row)
+
+        layout.addLayout(cam_form)
+
+        # --- Preset buttons ---
+        preset_row = QHBoxLayout()
+        preset_row.setSpacing(4)
+        for name, (az, el, dist) in ANGLE_PRESETS.items():
+            btn = QPushButton(name)
+            btn.setToolTip(f"Azimuth {az}°, Elevation {el}°, Distance {dist / 100:.1f}")
+            btn.clicked.connect(lambda checked=False, a=az, e=el, d=dist: self._apply_angle_preset(a, e, d))
+            preset_row.addWidget(btn)
+        layout.addLayout(preset_row)
+
+        # --- Settings form ---
+        settings_widget = QWidget()
+        form = QFormLayout(settings_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setHorizontalSpacing(20)
+
+        self._angle_quantize = QSpinBox()
+        self._angle_quantize.setSpecialValueText("None")
+        self._angle_quantize.setRange(0, 8)
+        self._angle_quantize.setValue(4)
+        self._angle_quantize.setToolTip("Quantize level for the model.")
+        form.addRow("Quantize", self._angle_quantize)
+
+        self._angle_steps = QSpinBox()
+        self._angle_steps.setRange(1, 100)
+        self._angle_steps.setValue(20)
+        self._angle_steps.setToolTip("Number of denoising steps.")
+        form.addRow("Steps", self._angle_steps)
+
+        scale_row, self._angle_scale, self._angle_scale_spin = self._make_slider_row(
+            0, 100, 50, "Scale of the canvas sent to mflux relative to its original size."
+        )
+        form.addRow("Scale", scale_row)
+
+        seed_row, self._angle_seed, self._angle_random_seed = self._make_seed_row()
+        form.addRow("Seed", seed_row)
+
+        layout.addWidget(settings_widget)
+        layout.addStretch()
+        content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+
+        return content
+
+    # ------------------------------------------------------------------
+    # Widget factory helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_slider_row(min_val: int, max_val: int, default: int, tooltip: str) -> tuple:
+        """Create a slider+spinbox row. Returns (row_widget, slider, spinbox)."""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(min_val, max_val)
+        slider.setValue(default)
+        spin = QDoubleSpinBox()
+        spin.setRange(min_val / 100, max_val / 100)
+        spin.setSingleStep(0.01)
+        spin.setDecimals(2)
+        spin.setValue(default / 100)
+        spin.setFixedWidth(60)
+        slider.valueChanged.connect(lambda v: spin.setValue(v / 100))
+        spin.valueChanged.connect(lambda v: slider.setValue(int(v * 100)))
+        layout.addWidget(slider)
+        layout.addWidget(spin)
+        row.setToolTip(tooltip)
+        return row, slider, spin
+
+    @staticmethod
+    def _make_seed_row() -> tuple:
+        """Create a seed+random checkbox row. Returns (row_widget, seed_spin, random_cb)."""
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        seed = QSpinBox()
+        seed.setRange(0, 2_000_000_000)
+        seed.setValue(0)
+        random_cb = QCheckBox("Random")
+        random_cb.setChecked(False)
+        random_cb.toggled.connect(seed.setDisabled)
+        seed.setDisabled(False)
+        layout.addWidget(seed)
+        layout.addWidget(random_cb)
+        row.setToolTip(
+            "Fixed seed produces the same result every time given the same inputs.\n"
+            "Random seed gives a different result on each generation."
+        )
+        return row, seed, random_cb
+
+    # ------------------------------------------------------------------
+    # Tab-specific UI updates
+    # ------------------------------------------------------------------
+
+    def _on_tab_changed(self, index: int) -> None:
+        self._save_settings()
+        self._update_generate_btn()
+        # Tell the parent layout that our preferred size has changed so it
+        # re-flows without stretching the tab widget to fill leftover space.
+        self._tabs.updateGeometry()
+
+    def _update_generate_tab_ui(self) -> None:
+        model_name = self._gen_model.currentText()
+        _, _, supports_strength, supports_guidance, *_ = MODEL_CLI.get(
+            model_name, (None, None, True, True, False)
+        )
+        self._gen_guidance.setVisible(supports_guidance)
+        if self._gen_guidance_label:
+            self._gen_guidance_label.setVisible(supports_guidance)
+        self._gen_strength_row.setVisible(supports_strength)
+        if self._gen_strength_label:
+            self._gen_strength_label.setVisible(supports_strength)
+
+    def _update_edit_tab_ui(self) -> None:
+        model_name = self._edit_model.currentText()
+        _, _, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
+            model_name, (None, None, True, True, False)
+        )
+        needs_ref = rest[0] if rest else False
+        self._edit_guidance.setVisible(supports_guidance)
+        if self._edit_guidance_label:
+            self._edit_guidance_label.setVisible(supports_guidance)
+        self._edit_strength_row.setVisible(supports_strength)
+        if self._edit_strength_label:
+            self._edit_strength_label.setVisible(supports_strength)
+        self._edit_ref_section.setVisible(needs_ref)
+
+    # ------------------------------------------------------------------
+    # Angle helpers
+    # ------------------------------------------------------------------
+
+    def _build_angle_prompt(self) -> str:
+        az_desc = _snap_to_nearest_wrap(self._angle_azimuth.value(), AZIMUTH_MAP)
+        el_desc = _snap_to_nearest(self._angle_elevation.value(), ELEVATION_MAP)
+        dist_desc = _snap_to_nearest(self._angle_distance.value(), DISTANCE_MAP)
+        return f"{ANGLE_TRIGGER_TOKEN} {az_desc}, {el_desc}, {dist_desc}"
+
+    def _apply_angle_preset(self, azimuth: int, elevation: int, distance: int) -> None:
+        self._angle_azimuth.blockSignals(True)
+        self._angle_elevation.blockSignals(True)
+        self._angle_distance.blockSignals(True)
+        self._angle_azimuth.setValue(azimuth)
+        self._angle_elevation.setValue(elevation)
+        self._angle_distance.setValue(distance)
+        self._angle_azimuth.blockSignals(False)
+        self._angle_elevation.blockSignals(False)
+        self._angle_distance.blockSignals(False)
+        # Sync spin boxes.
+        self._angle_azimuth_spin.setValue(azimuth)
+        self._angle_elevation_spin.setValue(elevation)
+        self._angle_distance_spin.setValue(distance / 100)
 
     # ------------------------------------------------------------------
     # Settings persistence
@@ -712,39 +1065,85 @@ class KritaiDocker(DockWidget):
     ANNOTATION_TYPE = "kritai_settings"
 
     def _connect_settings_signals(self) -> None:
-        # All changes persist settings immediately.
+        # Generate tab signals.
         for signal in [
-            self._prompt.textChanged,
-            self._negative_prompt.textChanged,
-            self._model.currentIndexChanged,
-            self._quantize.valueChanged,
-            self._steps.valueChanged,
-            self._guidance.valueChanged,
-            self._strength.valueChanged,
-            self._scale.valueChanged,
-            self._seed.valueChanged,
-            self._random_seed.toggled,
+            self._gen_prompt.textChanged,
+            self._gen_model.currentIndexChanged,
+            self._gen_quantize.valueChanged,
+            self._gen_steps.valueChanged,
+            self._gen_guidance.valueChanged,
+            self._gen_strength.valueChanged,
+            self._gen_scale.valueChanged,
+            self._gen_seed.valueChanged,
+            self._gen_random_seed.toggled,
         ]:
             signal.connect(self._save_settings)
 
-        # Auto-refresh triggers only on focus-out for text fields,
-        # immediately for all other controls.
-        self._negative_prompt.editingFinished.connect(self._on_setting_changed)
+        # Edit tab signals.
+        for signal in [
+            self._edit_prompt.textChanged,
+            self._edit_model.currentIndexChanged,
+            self._edit_quantize.valueChanged,
+            self._edit_steps.valueChanged,
+            self._edit_guidance.valueChanged,
+            self._edit_strength.valueChanged,
+            self._edit_scale.valueChanged,
+            self._edit_seed.valueChanged,
+            self._edit_random_seed.toggled,
+        ]:
+            signal.connect(self._save_settings)
 
-        prompt_filter = _FocusOutSignal(self._prompt)
-        prompt_filter.focusLost.connect(self._on_setting_changed)
+        # Angle tab signals.
+        for signal in [
+            self._angle_azimuth.valueChanged,
+            self._angle_elevation.valueChanged,
+            self._angle_distance.valueChanged,
+            self._angle_quantize.valueChanged,
+            self._angle_steps.valueChanged,
+            self._angle_scale.valueChanged,
+            self._angle_seed.valueChanged,
+            self._angle_random_seed.toggled,
+        ]:
+            signal.connect(self._save_settings)
+
+        # Auto-refresh triggers — text fields on focus-out, others immediately.
+        gen_prompt_filter = _FocusOutSignal(self._gen_prompt)
+        gen_prompt_filter.focusLost.connect(self._on_setting_changed)
+
+        edit_prompt_filter = _FocusOutSignal(self._edit_prompt)
+        edit_prompt_filter.focusLost.connect(self._on_setting_changed)
 
         for signal in [
-            self._model.currentIndexChanged,
-            self._quantize.valueChanged,
-            self._steps.valueChanged,
-            self._guidance.valueChanged,
-            self._strength.valueChanged,
-            self._scale.valueChanged,
-            self._seed.valueChanged,
-            self._random_seed.toggled,
+            self._gen_model.currentIndexChanged,
+            self._gen_quantize.valueChanged,
+            self._gen_steps.valueChanged,
+            self._gen_guidance.valueChanged,
+            self._gen_strength.valueChanged,
+            self._gen_scale.valueChanged,
+            self._gen_seed.valueChanged,
+            self._gen_random_seed.toggled,
+            self._edit_model.currentIndexChanged,
+            self._edit_quantize.valueChanged,
+            self._edit_steps.valueChanged,
+            self._edit_guidance.valueChanged,
+            self._edit_strength.valueChanged,
+            self._edit_scale.valueChanged,
+            self._edit_seed.valueChanged,
+            self._edit_random_seed.toggled,
+            self._angle_azimuth.valueChanged,
+            self._angle_elevation.valueChanged,
+            self._angle_distance.valueChanged,
+            self._angle_quantize.valueChanged,
+            self._angle_steps.valueChanged,
+            self._angle_scale.valueChanged,
+            self._angle_seed.valueChanged,
+            self._angle_random_seed.toggled,
         ]:
             signal.connect(self._on_setting_changed)
+
+        # Generate button update on prompt change.
+        self._gen_prompt.textChanged.connect(self._update_generate_btn)
+        self._edit_prompt.textChanged.connect(self._update_generate_btn)
 
     def _on_setting_changed(self) -> None:
         if self._auto_btn.isChecked():
@@ -756,25 +1155,52 @@ class KritaiDocker(DockWidget):
             return
         uid = doc.fileName() or str(id(doc))
         new = {
-            "prompt": self._prompt.toPlainText(),
-            "negative_prompt": self._negative_prompt.text(),
-            "reference_images": [
-                {"path": t.imagePath() or "", "prompt": p.text().strip(), "enabled": e.isChecked()}
-                for e, t, p, _ in self._ref_entries
-                if (t.imagePath() or "").strip() or p.text().strip()
-            ],
-            "model": self._model.currentText(),
-            "quantize": self._quantize.value(),
-            "steps": self._steps.value(),
-            "guidance": self._guidance.value(),
-            "strength": self._strength.value() / 100,
-            "scale": self._scale.value() / 100,
-            "seed": self._seed.value(),
-            "random_seed": self._random_seed.isChecked(),
-            "loras": [
-                {"path": p.text().strip(), "scale": s.value(), "enabled": e.isChecked()}
-                for e, p, s, _ in self._lora_entries if p.text().strip()
-            ],
+            "active_tab": self._tabs.currentIndex(),
+            "generate": {
+                "model": self._gen_model.currentText(),
+                "prompt": self._gen_prompt.toPlainText(),
+                "quantize": self._gen_quantize.value(),
+                "steps": self._gen_steps.value(),
+                "guidance": self._gen_guidance.value(),
+                "strength": self._gen_strength.value() / 100,
+                "scale": self._gen_scale.value() / 100,
+                "seed": self._gen_seed.value(),
+                "random_seed": self._gen_random_seed.isChecked(),
+                "loras": [
+                    {"path": p.text().strip(), "scale": s.value(), "enabled": e.isChecked()}
+                    for e, p, s, _ in self._gen_lora_entries if p.text().strip()
+                ],
+            },
+            "edit": {
+                "model": self._edit_model.currentText(),
+                "prompt": self._edit_prompt.toPlainText(),
+                "quantize": self._edit_quantize.value(),
+                "steps": self._edit_steps.value(),
+                "guidance": self._edit_guidance.value(),
+                "strength": self._edit_strength.value() / 100,
+                "scale": self._edit_scale.value() / 100,
+                "seed": self._edit_seed.value(),
+                "random_seed": self._edit_random_seed.isChecked(),
+                "reference_images": [
+                    {"path": t.imagePath() or "", "prompt": p.text().strip(), "enabled": e.isChecked()}
+                    for e, t, p, _ in self._edit_ref_entries
+                    if (t.imagePath() or "").strip() or p.text().strip()
+                ],
+                "loras": [
+                    {"path": p.text().strip(), "scale": s.value(), "enabled": e.isChecked()}
+                    for e, p, s, _ in self._edit_lora_entries if p.text().strip()
+                ],
+            },
+            "angle": {
+                "azimuth": self._angle_azimuth.value(),
+                "elevation": self._angle_elevation.value(),
+                "distance": self._angle_distance.value(),
+                "quantize": self._angle_quantize.value(),
+                "steps": self._angle_steps.value(),
+                "scale": self._angle_scale.value() / 100,
+                "seed": self._angle_seed.value(),
+                "random_seed": self._angle_random_seed.isChecked(),
+            },
             "upscale": self._upscale_settings.get(uid, {}),
             "preview_path": self._tmp_output or "",
         }
@@ -829,60 +1255,115 @@ class KritaiDocker(DockWidget):
                 return
             self._doc_settings[uid] = data
 
-        # Block signals while restoring to avoid triggering _save_settings
-        # for each individual widget change.
-        widgets = [
-            self._prompt, self._negative_prompt, self._model,
-            self._quantize, self._steps, self._guidance,
-            self._strength, self._scale, self._seed, self._random_seed,
+        # Migrate old flat format.
+        if "active_tab" not in data:
+            data = self._migrate_old_settings(data, uid)
+
+        # Block signals while restoring.
+        all_widgets = [
+            self._gen_prompt, self._gen_model,
+            self._gen_quantize, self._gen_steps, self._gen_guidance,
+            self._gen_strength, self._gen_scale, self._gen_seed, self._gen_random_seed,
+            self._edit_prompt, self._edit_model,
+            self._edit_quantize, self._edit_steps, self._edit_guidance,
+            self._edit_strength, self._edit_scale, self._edit_seed, self._edit_random_seed,
+            self._angle_azimuth, self._angle_elevation, self._angle_distance,
+            self._angle_quantize, self._angle_steps,
+            self._angle_scale, self._angle_seed, self._angle_random_seed,
+            self._tabs,
         ]
-        for w in widgets:
+        for w in all_widgets:
             w.blockSignals(True)
 
-        self._prompt.setPlainText(data.get("prompt", ""))
-        self._negative_prompt.setText(data.get("negative_prompt", ""))
-        # Restore reference images.
-        for *_, row in list(self._ref_entries):
-            self._ref_list.removeWidget(row)
-            row.deleteLater()
-        self._ref_entries.clear()
-        for ref in data.get("reference_images", []):
-            self._add_ref_row(ref.get("path", ""), ref.get("prompt", ""), ref.get("enabled", True))
-        # Backward compat: migrate old single reference_image field.
-        if not data.get("reference_images") and data.get("reference_image"):
-            self._add_ref_row(data["reference_image"], "", True)
-        model = data.get("model", "dev")
-        idx = self._model.findText(model)
+        # --- Restore Generate tab ---
+        gen = data.get("generate", {})
+        self._gen_prompt.setPlainText(gen.get("prompt", ""))
+        idx = self._gen_model.findText(gen.get("model", "flux2-klein-4b"))
         if idx >= 0:
-            self._model.setCurrentIndex(idx)
-        self._quantize.setValue(data.get("quantize", 4))
-        self._steps.setValue(data.get("steps", 20))
-        self._guidance.setValue(data.get("guidance", 3.5))
-        strength_val = int(data.get("strength", 0.75) * 100)
-        self._strength.setValue(strength_val)
-        self._strength_spin.setValue(strength_val / 100)
-        scale_val = int(data.get("scale", data.get("downscale", data.get("resolution_scale", 0.5))) * 100)
-        self._scale.setValue(scale_val)
-        self._scale_spin.setValue(scale_val / 100)
-        self._seed.setValue(data.get("seed", 0))
-        self._random_seed.setChecked(data.get("random_seed", False))
-
-        # Restore LoRAs.
-        # Clear existing rows.
-        for *_, row in list(self._lora_entries):
-            self._lora_list.removeWidget(row)
+            self._gen_model.setCurrentIndex(idx)
+        self._gen_quantize.setValue(gen.get("quantize", 4))
+        self._gen_steps.setValue(gen.get("steps", 20))
+        self._gen_guidance.setValue(gen.get("guidance", 3.5))
+        sv = int(gen.get("strength", 0.75) * 100)
+        self._gen_strength.setValue(sv)
+        self._gen_strength_spin.setValue(sv / 100)
+        scv = int(gen.get("scale", 0.5) * 100)
+        self._gen_scale.setValue(scv)
+        self._gen_scale_spin.setValue(scv / 100)
+        self._gen_seed.setValue(gen.get("seed", 0))
+        self._gen_random_seed.setChecked(gen.get("random_seed", False))
+        self._gen_seed.setDisabled(self._gen_random_seed.isChecked())
+        # Restore generate LoRAs.
+        for *_, row in list(self._gen_lora_entries):
+            self._gen_lora_list.removeWidget(row)
             row.deleteLater()
-        self._lora_entries.clear()
-        for lora in data.get("loras", []):
-            self._add_lora_row(lora.get("path", ""), lora.get("scale", 1.0), lora.get("enabled", True))
+        self._gen_lora_entries.clear()
+        for lora in gen.get("loras", []):
+            self._add_lora_row(self._gen_lora_entries, self._gen_lora_list,
+                               lora.get("path", ""), lora.get("scale", 1.0), lora.get("enabled", True))
 
-        # Restore upscale settings.
+        # --- Restore Edit tab ---
+        edit = data.get("edit", {})
+        self._edit_prompt.setPlainText(edit.get("prompt", ""))
+        idx = self._edit_model.findText(edit.get("model", "flux2-edit"))
+        if idx >= 0:
+            self._edit_model.setCurrentIndex(idx)
+        self._edit_quantize.setValue(edit.get("quantize", 4))
+        self._edit_steps.setValue(edit.get("steps", 20))
+        self._edit_guidance.setValue(edit.get("guidance", 3.5))
+        sv = int(edit.get("strength", 0.75) * 100)
+        self._edit_strength.setValue(sv)
+        self._edit_strength_spin.setValue(sv / 100)
+        scv = int(edit.get("scale", 0.5) * 100)
+        self._edit_scale.setValue(scv)
+        self._edit_scale_spin.setValue(scv / 100)
+        self._edit_seed.setValue(edit.get("seed", 0))
+        self._edit_random_seed.setChecked(edit.get("random_seed", False))
+        self._edit_seed.setDisabled(self._edit_random_seed.isChecked())
+        # Restore edit reference images.
+        for *_, row in list(self._edit_ref_entries):
+            self._edit_ref_list.removeWidget(row)
+            row.deleteLater()
+        self._edit_ref_entries.clear()
+        for ref in edit.get("reference_images", []):
+            self._add_ref_row(self._edit_ref_entries, self._edit_ref_list,
+                              ref.get("path", ""), ref.get("prompt", ""), ref.get("enabled", True))
+        # Restore edit LoRAs.
+        for *_, row in list(self._edit_lora_entries):
+            self._edit_lora_list.removeWidget(row)
+            row.deleteLater()
+        self._edit_lora_entries.clear()
+        for lora in edit.get("loras", []):
+            self._add_lora_row(self._edit_lora_entries, self._edit_lora_list,
+                               lora.get("path", ""), lora.get("scale", 1.0), lora.get("enabled", True))
+
+        # --- Restore Angle tab ---
+        angle = data.get("angle", {})
+        self._angle_azimuth.setValue(angle.get("azimuth", 0))
+        self._angle_azimuth_spin.setValue(angle.get("azimuth", 0))
+        self._angle_elevation.setValue(angle.get("elevation", 0))
+        self._angle_elevation_spin.setValue(angle.get("elevation", 0))
+        dv = angle.get("distance", 100)
+        self._angle_distance.setValue(dv)
+        self._angle_distance_spin.setValue(dv / 100)
+        self._angle_quantize.setValue(angle.get("quantize", 4))
+        self._angle_steps.setValue(angle.get("steps", 20))
+        ascv = int(angle.get("scale", 0.5) * 100)
+        self._angle_scale.setValue(ascv)
+        self._angle_scale_spin.setValue(ascv / 100)
+        self._angle_seed.setValue(angle.get("seed", 0))
+        self._angle_random_seed.setChecked(angle.get("random_seed", False))
+        self._angle_seed.setDisabled(self._angle_random_seed.isChecked())
+
+        # --- Restore active tab ---
+        self._tabs.setCurrentIndex(data.get("active_tab", 0))
+
+        # --- Restore upscale settings ---
         upscale = data.get("upscale")
         if upscale:
             self._upscale_settings[uid] = upscale
-        self._seed.setDisabled(self._random_seed.isChecked())
 
-        # Restore preview image if the temp file still exists.
+        # --- Restore preview image if the temp file still exists ---
         preview_path = data.get("preview_path", "")
         if preview_path and os.path.exists(preview_path):
             self._tmp_output = preview_path
@@ -891,10 +1372,41 @@ class KritaiDocker(DockWidget):
                 self._preview.setPixmap(pixmap)
                 self._doc_previews[uid] = pixmap
 
-        for w in widgets:
+        for w in all_widgets:
             w.blockSignals(False)
 
-        self._update_model_ui()
+        self._update_generate_tab_ui()
+        self._update_edit_tab_ui()
+
+    def _migrate_old_settings(self, data: dict, uid: str) -> dict:
+        """Migrate old flat settings format to new namespaced format."""
+        old_model = data.get("model", "flux2-klein-4b")
+        common = {
+            "prompt": data.get("prompt", ""),
+            "quantize": data.get("quantize", 4),
+            "steps": data.get("steps", 20),
+            "guidance": data.get("guidance", 3.5),
+            "strength": data.get("strength", 0.75),
+            "scale": data.get("scale", data.get("downscale", data.get("resolution_scale", 0.5))),
+            "seed": data.get("seed", 0),
+            "random_seed": data.get("random_seed", False),
+            "loras": data.get("loras", []),
+        }
+        if old_model in EDIT_MODELS:
+            edit_data = {**common, "model": old_model}
+            # Migrate reference images.
+            refs = data.get("reference_images", [])
+            if not refs and data.get("reference_image"):
+                refs = [{"path": data["reference_image"], "prompt": "", "enabled": True}]
+            edit_data["reference_images"] = refs
+            migrated = {"active_tab": 1, "generate": {}, "edit": edit_data, "angle": {}}
+        else:
+            gen_data = {**common, "model": old_model}
+            migrated = {"active_tab": 0, "generate": gen_data, "edit": {}, "angle": {}}
+        migrated["upscale"] = data.get("upscale", {})
+        migrated["preview_path"] = data.get("preview_path", "")
+        self._doc_settings[uid] = migrated
+        return migrated
 
     # ------------------------------------------------------------------
     # Auto-mode
@@ -937,8 +1449,14 @@ class KritaiDocker(DockWidget):
             self._generate_btn.setEnabled(False)
             self._generate_btn.setToolTip("No active document.")
             return
-        prompt = self._build_prompt()
-        if not prompt:
+        tab = self._tabs.currentIndex()
+        if tab == 0:
+            has_prompt = bool(self._gen_prompt.toPlainText().strip())
+        elif tab == 1:
+            has_prompt = bool(self._edit_prompt.toPlainText().strip())
+        else:
+            has_prompt = True  # Angle tab always has auto-generated prompt.
+        if not has_prompt:
             self._generate_btn.setEnabled(False)
             self._generate_btn.setToolTip("Enter a prompt to generate.")
             return
@@ -989,7 +1507,15 @@ class KritaiDocker(DockWidget):
         doc = app.activeDocument()
         if not doc:
             return
-        prompt = self._build_prompt()
+
+        tab = self._tabs.currentIndex()
+        if tab == 0:
+            prompt = self._gen_prompt.toPlainText().strip()
+        elif tab == 1:
+            prompt = self._build_edit_prompt()
+        else:
+            prompt = self._build_angle_prompt()
+
         if not prompt:
             return
 
@@ -1016,65 +1542,12 @@ class KritaiDocker(DockWidget):
 
         self._export_canvas(doc, self._tmp_input)
 
-        scale = self._scale.value() / 100
-        target_w = max(1, int(doc.width() * scale))
-        target_h = max(1, int(doc.height() * scale))
-
-        model_name = self._model.currentText()
-        cli_name, model_flag, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
-            model_name, ("mflux-generate", model_name, True, True, False)
-        )
-        needs_reference = rest[0] if rest else False
-
-        # Pre-scale the input image for edit models that don't accept --width/--height arguments.
-        scale_input = needs_reference
-        if scale_input and abs(scale - 1.0) >= 0.001:
-            img = QImage(self._tmp_input)
-            if not img.isNull():
-                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
-        cli_path = os.path.join(MFLUX_DIR, cli_name)
-
-        cmd = [cli_path, "--prompt", prompt]
-
-        if model_flag:
-            cmd += ["--model", model_flag]
-
-        if needs_reference:
-            cmd += ["--image-paths", self._tmp_input]
-            for enabled_cb, thumb, _, _ in self._ref_entries:
-                if not enabled_cb.isChecked():
-                    continue
-                ref_path = (thumb.imagePath() or "").strip()
-                if ref_path:
-                    cmd.append(ref_path)
+        if tab == 0:
+            cmd = self._build_generate_cmd(prompt, doc)
+        elif tab == 1:
+            cmd = self._build_edit_cmd(prompt, doc)
         else:
-            cmd += ["--image-path", self._tmp_input]
-
-        cmd += [
-            "--steps", str(self._steps.value()),
-            "--output", self._tmp_output,
-        ]
-
-        if abs(scale - 1.0) >= 0.001 and not scale_input:
-            cmd += ["--width", str(target_w), "--height", str(target_h)]
-
-        if supports_guidance:
-            cmd += ["--guidance", str(self._guidance.value())]
-
-        if supports_strength:
-            cmd += ["--image-strength", str(self._strength.value() / 100)]
-
-        if self._quantize.value() > 0:
-            cmd += ["--quantize", str(self._quantize.value())]
-
-        neg = self._negative_prompt.text().strip()
-        if neg:
-            cmd += ["--negative-prompt", neg]
-
-        if not self._random_seed.isChecked():
-            cmd += ["--seed", str(self._seed.value())]
-
-        cmd += self._get_lora_args()
+            cmd = self._build_angle_cmd(prompt, doc)
 
         self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
         self._gen_start_time = time.monotonic()
@@ -1085,6 +1558,125 @@ class KritaiDocker(DockWidget):
         self._thread.logged.connect(self._on_log_message)
         self._thread.progress.connect(self._on_progress)
         self._thread.start()
+
+    def _build_generate_cmd(self, prompt: str, doc: object) -> list[str]:
+        model_name = self._gen_model.currentText()
+        cli_name, model_flag, supports_strength, supports_guidance, *_ = MODEL_CLI.get(
+            model_name, ("mflux-generate-flux2", model_name, True, True, False)
+        )
+        scale = self._gen_scale.value() / 100
+        target_w = max(1, int(doc.width() * scale))
+        target_h = max(1, int(doc.height() * scale))
+        cli_path = os.path.join(MFLUX_DIR, cli_name)
+
+        cmd = [cli_path, "--prompt", prompt]
+        if model_flag:
+            cmd += ["--model", model_flag]
+        cmd += ["--image-path", self._tmp_input]
+        cmd += ["--steps", str(self._gen_steps.value()), "--output", self._tmp_output]
+        if abs(scale - 1.0) >= 0.001:
+            cmd += ["--width", str(target_w), "--height", str(target_h)]
+        if supports_guidance:
+            cmd += ["--guidance", str(self._gen_guidance.value())]
+        if supports_strength:
+            cmd += ["--image-strength", str(self._gen_strength.value() / 100)]
+        if self._gen_quantize.value() > 0:
+            cmd += ["--quantize", str(self._gen_quantize.value())]
+        if not self._gen_random_seed.isChecked():
+            cmd += ["--seed", str(self._gen_seed.value())]
+        cmd += self._get_lora_args(self._gen_lora_entries)
+        return cmd
+
+    def _build_edit_cmd(self, prompt: str, doc: object) -> list[str]:
+        model_name = self._edit_model.currentText()
+        cli_name, model_flag, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
+            model_name, ("mflux-generate-flux2-edit", None, False, False, True)
+        )
+        needs_reference = rest[0] if rest else False
+        scale = self._edit_scale.value() / 100
+        target_w = max(1, int(doc.width() * scale))
+        target_h = max(1, int(doc.height() * scale))
+
+        # Pre-scale the input image for edit models that don't accept --width/--height.
+        scale_input = needs_reference
+        if scale_input and abs(scale - 1.0) >= 0.001:
+            img = QImage(self._tmp_input)
+            if not img.isNull():
+                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
+
+        cli_path = os.path.join(MFLUX_DIR, cli_name)
+        cmd = [cli_path, "--prompt", prompt]
+        if model_flag:
+            cmd += ["--model", model_flag]
+
+        if needs_reference:
+            cmd += ["--image-paths", self._tmp_input]
+            for enabled_cb, thumb, _, _ in self._edit_ref_entries:
+                if not enabled_cb.isChecked():
+                    continue
+                ref_path = (thumb.imagePath() or "").strip()
+                if ref_path:
+                    cmd.append(ref_path)
+        else:
+            cmd += ["--image-path", self._tmp_input]
+
+        cmd += ["--steps", str(self._edit_steps.value()), "--output", self._tmp_output]
+        if abs(scale - 1.0) >= 0.001 and not scale_input:
+            cmd += ["--width", str(target_w), "--height", str(target_h)]
+        if supports_guidance:
+            cmd += ["--guidance", str(self._edit_guidance.value())]
+        if supports_strength:
+            cmd += ["--image-strength", str(self._edit_strength.value() / 100)]
+        if self._edit_quantize.value() > 0:
+            cmd += ["--quantize", str(self._edit_quantize.value())]
+        if not self._edit_random_seed.isChecked():
+            cmd += ["--seed", str(self._edit_seed.value())]
+        cmd += self._get_lora_args(self._edit_lora_entries)
+        return cmd
+
+    def _build_angle_cmd(self, prompt: str, doc: object) -> list[str]:
+        scale = self._angle_scale.value() / 100
+        target_w = max(1, int(doc.width() * scale))
+        target_h = max(1, int(doc.height() * scale))
+
+        # Pre-scale for qwen-edit (doesn't accept --width/--height).
+        if abs(scale - 1.0) >= 0.001:
+            img = QImage(self._tmp_input)
+            if not img.isNull():
+                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
+
+        cli_path = os.path.join(MFLUX_DIR, "mflux-generate-qwen-edit")
+        cmd = [
+            cli_path,
+            "--prompt", prompt,
+            "--image-paths", self._tmp_input,
+            "--steps", str(self._angle_steps.value()),
+            "--output", self._tmp_output,
+        ]
+        if self._angle_quantize.value() > 0:
+            cmd += ["--quantize", str(self._angle_quantize.value())]
+        if not self._angle_random_seed.isChecked():
+            cmd += ["--seed", str(self._angle_seed.value())]
+        # Append angle LoRA.
+        cmd += ["--lora-paths", ANGLE_LORA_REPO, "--lora-scales", "1.0"]
+        return cmd
+
+    def _build_edit_prompt(self) -> str:
+        """Assemble the edit tab prompt with per-reference-image descriptions."""
+        parts: list[str] = []
+        main = self._edit_prompt.toPlainText().strip()
+        if main:
+            parts.append(main)
+        idx = 0
+        for enabled_cb, thumb, prompt_edit, _ in self._edit_ref_entries:
+            if not enabled_cb.isChecked():
+                continue
+            ref_path = (thumb.imagePath() or "").strip()
+            ref_prompt = prompt_edit.text().strip()
+            if ref_path and ref_prompt:
+                idx += 1
+                parts.append(f"Reference image {idx}: {ref_prompt}")
+        return "\n".join(parts)
 
     def _on_finished(self, output_path: str) -> None:
         self._set_busy(False)
@@ -1121,7 +1713,11 @@ class KritaiDocker(DockWidget):
 
     def _on_log_toggled(self, checked: bool) -> None:
         self._log.setVisible(checked)
-        self._clear_btn.setVisible(checked)
+        self._log_btns.setVisible(checked)
+
+    def _copy_log(self) -> None:
+        from PyQt5.QtWidgets import QApplication
+        QApplication.clipboard().setText(self._log.toPlainText())
 
     def _clear_log(self) -> None:
         self._log.clear()
@@ -1331,7 +1927,8 @@ class KritaiDocker(DockWidget):
             if not dlg_random_seed.isChecked():
                 cmd += ["--seed", str(dlg_seed.value())]
 
-            cmd += self._get_lora_args()
+            # Use edit tab LoRAs for fill selection.
+            cmd += self._get_lora_args(self._edit_lora_entries)
 
             self._on_log_message("Running: " + " ".join(
                 f'"{t}"' if " " in t else t for t in cmd
@@ -1401,7 +1998,16 @@ class KritaiDocker(DockWidget):
             return
 
         uid = doc.fileName() or str(id(doc))
-        scale = self._scale.value() / 100
+
+        # Determine scale from the active tab.
+        tab = self._tabs.currentIndex()
+        if tab == 0:
+            scale = self._gen_scale.value() / 100
+        elif tab == 1:
+            scale = self._edit_scale.value() / 100
+        else:
+            scale = self._angle_scale.value() / 100
+
         can_upscale = (
             scale < 1.0
             and self._tmp_output
@@ -1447,7 +2053,11 @@ class KritaiDocker(DockWidget):
         quantize = QSpinBox()
         quantize.setSpecialValueText("None")
         quantize.setRange(0, 8)
-        quantize.setValue(saved.get("quantize", self._quantize.value()))
+        # Use active tab's quantize as default.
+        default_q = self._gen_quantize.value() if tab == 0 else (
+            self._edit_quantize.value() if tab == 1 else self._angle_quantize.value()
+        )
+        quantize.setValue(saved.get("quantize", default_q))
         upscale_form.addRow("Quantize", quantize)
 
         seed_row = QWidget()
@@ -1588,25 +2198,11 @@ class KritaiDocker(DockWidget):
         self._auto_btn.setChecked(False)
 
     # ------------------------------------------------------------------
+    # LoRA / Reference helpers (parameterized)
+    # ------------------------------------------------------------------
 
-    def _update_model_ui(self) -> None:
-        model_name = self._model.currentText()
-        _, _, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
-            model_name, (None, None, True, True, False)
-        )
-        needs_ref = rest[0] if rest else False
-
-        self._guidance.setVisible(supports_guidance)
-        if self._guidance_label:
-            self._guidance_label.setVisible(supports_guidance)
-
-        self._strength_row.setVisible(supports_strength)
-        if self._strength_label_form:
-            self._strength_label_form.setVisible(supports_strength)
-
-        self._ref_section.setVisible(needs_ref)
-
-    def _add_lora_row(self, path: str = "", scale: float = 1.0, enabled: bool = True) -> None:
+    def _add_lora_row(self, entries_list: list, lora_layout: QVBoxLayout,
+                      path: str = "", scale: float = 1.0, enabled: bool = True) -> None:
         """Add a LoRA entry row with enable checkbox, path, scale, and remove button."""
         from PyQt5.QtWidgets import QFileDialog
 
@@ -1647,7 +2243,9 @@ class KritaiDocker(DockWidget):
 
         remove_btn = QPushButton("×")
         remove_btn.setFixedWidth(22)
-        remove_btn.clicked.connect(lambda checked=False, r=row: self._remove_lora_row(r))
+        remove_btn.clicked.connect(
+            lambda checked=False, r=row: self._remove_lora_row(entries_list, lora_layout, r)
+        )
 
         row_layout.addWidget(enabled_cb)
         row_layout.addWidget(path_edit, 1)
@@ -1655,21 +2253,20 @@ class KritaiDocker(DockWidget):
         row_layout.addWidget(scale_spin)
         row_layout.addWidget(remove_btn)
 
-        self._lora_list.addWidget(row)
-        self._lora_entries.append((enabled_cb, path_edit, scale_spin, row))
+        lora_layout.addWidget(row)
+        entries_list.append((enabled_cb, path_edit, scale_spin, row))
 
-    def _remove_lora_row(self, row: QWidget) -> None:
-        self._lora_entries = [
-            e for e in self._lora_entries if e[-1] is not row
-        ]
-        self._lora_list.removeWidget(row)
+    def _remove_lora_row(self, entries_list: list, lora_layout: QVBoxLayout, row: QWidget) -> None:
+        entries_list[:] = [e for e in entries_list if e[-1] is not row]
+        lora_layout.removeWidget(row)
         row.deleteLater()
 
-    def _get_lora_args(self) -> list[str]:
+    @staticmethod
+    def _get_lora_args(entries_list: list) -> list[str]:
         """Return the --lora-paths and --lora-scales command fragments."""
         paths = []
         scales = []
-        for enabled_cb, path_edit, scale_spin, _ in self._lora_entries:
+        for enabled_cb, path_edit, scale_spin, _ in entries_list:
             if not enabled_cb.isChecked():
                 continue
             p = path_edit.text().strip()
@@ -1680,7 +2277,8 @@ class KritaiDocker(DockWidget):
             return []
         return ["--lora-paths"] + paths + ["--lora-scales"] + scales
 
-    def _add_ref_row(self, path: str = "", prompt: str = "", enabled: bool = True) -> None:
+    def _add_ref_row(self, entries_list: list, ref_layout: QVBoxLayout,
+                     path: str = "", prompt: str = "", enabled: bool = True) -> None:
         """Add a reference image entry with enable checkbox, thumbnail, prompt, and remove button."""
         row = QWidget()
         row_layout = QHBoxLayout(row)
@@ -1701,7 +2299,9 @@ class KritaiDocker(DockWidget):
 
         remove_btn = QPushButton("×")
         remove_btn.setFixedWidth(22)
-        remove_btn.clicked.connect(lambda checked=False, r=row: self._remove_ref_row(r))
+        remove_btn.clicked.connect(
+            lambda checked=False, r=row: self._remove_ref_row(entries_list, ref_layout, r)
+        )
 
         row_layout.addWidget(enabled_cb)
         row_layout.addWidget(thumb)
@@ -1712,34 +2312,17 @@ class KritaiDocker(DockWidget):
         enabled_cb.toggled.connect(self._update_generate_btn)
         thumb.pathChanged.connect(self._update_generate_btn)
 
-        self._ref_list.addWidget(row)
-        self._ref_entries.append((enabled_cb, thumb, prompt_edit, row))
+        ref_layout.addWidget(row)
+        entries_list.append((enabled_cb, thumb, prompt_edit, row))
         self._update_generate_btn()
 
-    def _remove_ref_row(self, row: QWidget) -> None:
-        self._ref_entries = [
-            e for e in self._ref_entries if e[-1] is not row
-        ]
-        self._ref_list.removeWidget(row)
+    def _remove_ref_row(self, entries_list: list, ref_layout: QVBoxLayout, row: QWidget) -> None:
+        entries_list[:] = [e for e in entries_list if e[-1] is not row]
+        ref_layout.removeWidget(row)
         row.deleteLater()
         self._update_generate_btn()
 
-    def _build_prompt(self) -> str:
-        """Assemble the main prompt with per-reference-image descriptions."""
-        parts: list[str] = []
-        main = self._prompt.toPlainText().strip()
-        if main:
-            parts.append(main)
-        idx = 0
-        for enabled_cb, thumb, prompt_edit, _ in self._ref_entries:
-            if not enabled_cb.isChecked():
-                continue
-            ref_path = (thumb.imagePath() or "").strip()
-            ref_prompt = prompt_edit.text().strip()
-            if ref_path and ref_prompt:
-                idx += 1
-                parts.append(f"Reference image {idx}: {ref_prompt}")
-        return "\n".join(parts)
+    # ------------------------------------------------------------------
 
     def _update_preview_ratio(self, doc: object) -> None:
         if doc and doc.width() > 0:
