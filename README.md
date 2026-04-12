@@ -2,11 +2,12 @@
 
 A Krita plugin that sends your canvas through a local [mflux](https://github.com/filipstrand/mflux) image-to-image pipeline and displays the result.
 
-This project is similar to the [Interstice](https://www.interstice.cloud/) plugin, but has different goals and is less ambitious in scope. Main priorities are:
+This project is similar to the [Interstice](https://www.interstice.cloud/) plugin, but has different goals and is less ambitious in scope. Main focuses are:
 
-- **Focus on macOS:** That's what I use and therefore that's what I care about.
-- **Focus on local yet fast generation:** Easy on the wallet, more private, and better for the planet.
-- **Focus on UX**: The plugin should be a joy to use, with a clean and intuitive interface, and minimal setup.
+- **macOS:** That's what I use and therefore that's what I care about.
+- **Local yet fast generation:** Private, and better for the planet.
+- **Permissive license:** Models and output can be used in any project.
+- **UX**: The plugin should be a joy to use, with a clean and intuitive interface, and minimal setup.
 
 ## Requirements
 
