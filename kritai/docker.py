@@ -63,36 +63,40 @@ MODEL_CLI = {
     "flux2-klein-9b":      ("mflux-generate-flux2",      "flux2-klein-9b",      True,  False, False),
     "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True,  False),
     "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
-    # FLUX.2 edit — canvas + optional reference image via --image-paths
+    # FLUX.2 edit — canvas + optional reference image via --image-paths.
+    # Model is chosen at runtime via the Edit tab's model selector.
     "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, True,  True),
-    # Kontext (image editing via instruction)
-    "kontext-dev":         ("mflux-generate-kontext",     "dev",                True,  True,  False),
-    "kontext-schnell":     ("mflux-generate-kontext",     "schnell",            True,  False, False),
 }
 
 # Which models belong to which tab.
 GENERATE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
-EDIT_MODELS = ["flux2-edit", "kontext-dev", "kontext-schnell"]
+EDIT_MODELS = ["flux2-edit"]
 
-# Angle LoRA configuration: lightning speed LoRA + multi-angle LoRA.
-ANGLE_LORA_PATHS = [
-    "lightx2v/Qwen-Image-Lightning:Qwen-Image-Edit-Lightning-4steps-V1.0-bf16.safetensors",
-    "dx8152/Qwen-Edit-2509-Multiple-angles",
-]
-ANGLE_LORA_SCALES = ["0.5", "1.0"]
+# Models available in the Angle tab (must be compatible with mflux-generate-flux2-edit).
+ANGLE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
 
 AZIMUTH_MAP = [
-    (0, "front view"), (45, "front-right quarter view"),
-    (90, "right side view"), (135, "back-right quarter view"),
-    (180, "back view"), (-135, "back-left quarter view"),
-    (-90, "left side view"), (-45, "front-left quarter view"),
+    (0,    "front view"),
+    (45,   "front-right quarter view"),
+    (90,   "right side view"),
+    (135,  "back-right quarter view"),
+    (180,  "back view"),
+    (-135, "back-left quarter view"),
+    (-90,  "left side view"),
+    (-45,  "front-left quarter view"),
 ]
 ELEVATION_MAP = [
-    (-90, "extreme low-angle shot"), (-30, "low-angle shot"), (0, "eye-level shot"),
-    (30, "elevated shot"), (60, "high-angle shot"), (90, "top-down shot"),
+    (-90, "extreme low angle, looking up"),
+    (-30, "low angle, slightly looking up"),
+    (0,   "eye level"),
+    (30,  "slightly elevated, looking down"),
+    (60,  "high angle, looking down"),
+    (90,  "top-down, bird's eye view"),
 ]
 DISTANCE_MAP = [
-    (60, "close-up"), (100, "medium shot"), (180, "wide shot"),
+    (60,  "close-up"),
+    (100, "medium shot"),
+    (180, "wide shot"),
 ]
 ANGLE_PRESETS = {
     "Front":  (0,    0,   100),
@@ -788,6 +792,9 @@ class KritaiDocker(DockWidget):
         self._preview.setStyleSheet("border-radius: 4px;")
         self._preview.setMaximumHeight(240)
         self._preview.setVisible(False)
+        outer.addWidget(self._log)
+        outer.addWidget(self._log_btns)
+
         outer.addWidget(self._preview)
 
         self._time_label = QLabel()
@@ -795,9 +802,6 @@ class KritaiDocker(DockWidget):
         self._time_label.setStyleSheet("color: #888; font-size: 11px;")
         self._time_label.setVisible(False)
         outer.addWidget(self._time_label)
-
-        outer.addWidget(self._log)
-        outer.addWidget(self._log_btns)
 
         outer.addStretch()
 
@@ -858,7 +862,7 @@ class KritaiDocker(DockWidget):
 
         self._gen_steps = QSpinBox()
         self._gen_steps.setRange(1, 100)
-        self._gen_steps.setValue(20)
+        self._gen_steps.setValue(8)
         self._gen_steps.setToolTip(
             "Number of denoising steps. More steps = higher quality but slower.\n"
             "Distilled models (klein) work well with 4–8 steps.\n"
@@ -929,20 +933,6 @@ class KritaiDocker(DockWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        # --- Model selector ---
-        self._edit_model = QComboBox()
-        model_tooltips = {
-            "flux2-edit":      "Edit the canvas with a prompt and an optional reference image.",
-            "kontext-dev":     "High-quality instruction-based image editing.",
-            "kontext-schnell": "Faster distilled variant. No guidance.",
-        }
-        for m in EDIT_MODELS:
-            self._edit_model.addItem(m)
-            idx = self._edit_model.count() - 1
-            self._edit_model.setItemData(idx, model_tooltips.get(m, ""), Qt.ToolTipRole)
-        self._edit_model.setCurrentIndex(0)
-        self._edit_model.currentIndexChanged.connect(self._update_edit_tab_ui)
-
         # --- Prompt ---
         self._edit_prompt = QPlainTextEdit()
         self._edit_prompt.setPlaceholderText("Prompt...")
@@ -958,6 +948,19 @@ class KritaiDocker(DockWidget):
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setHorizontalSpacing(20)
 
+        self._edit_model = QComboBox()
+        edit_model_tooltips = {
+            "flux2-klein-4b":      "Distilled 4B model. Fast, no guidance.",
+            "flux2-klein-9b":      "Distilled 9B model. Higher quality, no guidance.",
+            "flux2-klein-base-4b": "Base 4B model. Slower, supports guidance.",
+            "flux2-klein-base-9b": "Base 9B model. Best quality, supports guidance.",
+        }
+        for m in ANGLE_MODELS:
+            self._edit_model.addItem(m)
+            idx = self._edit_model.count() - 1
+            self._edit_model.setItemData(idx, edit_model_tooltips.get(m, ""), Qt.ToolTipRole)
+        self._edit_model.setCurrentIndex(2)  # default to base-4b for edit quality
+        self._edit_model.currentIndexChanged.connect(self._update_edit_tab_ui)
         form.addRow("Model", self._edit_model)
 
         self._edit_quantize = QSpinBox()
@@ -972,7 +975,7 @@ class KritaiDocker(DockWidget):
 
         self._edit_steps = QSpinBox()
         self._edit_steps.setRange(1, 100)
-        self._edit_steps.setValue(20)
+        self._edit_steps.setValue(8)
         self._edit_steps.setToolTip("Number of denoising steps.")
         form.addRow("Steps", self._edit_steps)
 
@@ -1061,9 +1064,17 @@ class KritaiDocker(DockWidget):
         cam_form.setSpacing(4)
         cam_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         cam_form.setHorizontalSpacing(8)
+        # On macOS the default is ExpandingFieldsGrow (only Expanding-policy
+        # widgets grow).  Force AllNonFixedFieldsGrow so that our Preferred-
+        # policy row widgets also fill the available right-column width.
+        cam_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         def _int_slider_row(lo, hi, default, suffix, tooltip):
             row = QWidget()
+            # Expanding policy is required for AllNonFixedFieldsGrow to stretch
+            # the row to fill the right column (Preferred alone is not enough on
+            # macOS even with AllNonFixedFieldsGrow).
+            row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             hl  = QHBoxLayout(row)
             hl.setContentsMargins(0, 0, 0, 0)
             hl.setSpacing(4)
@@ -1075,17 +1086,13 @@ class KritaiDocker(DockWidget):
             spin.setRange(lo, hi)
             spin.setValue(default)
             spin.setSuffix(suffix)
-            spin.setFixedWidth(64)
+            # Keep the spinbox compact so the slider has room in narrow dockers.
+            spin.setFixedWidth(50)
             spin.setToolTip(tooltip)
-            reset_btn = QToolButton()
-            reset_btn.setIcon(Krita.instance().icon("reload-preset"))
-            reset_btn.setToolTip(f"Reset to default ({default}{suffix})")
-            reset_btn.clicked.connect(lambda: slider.setValue(default))
             slider.valueChanged.connect(spin.setValue)
             spin.valueChanged.connect(slider.setValue)
             hl.addWidget(slider)
             hl.addWidget(spin)
-            hl.addWidget(reset_btn)
             return row, slider, spin
 
         az_row, self._angle_azimuth, self._angle_azimuth_spin = _int_slider_row(
@@ -1110,12 +1117,22 @@ class KritaiDocker(DockWidget):
         cam_form_widget.setLayout(cam_form)
         cam_form_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        # Right column: sliders on top, presets below.
-        right_col = QVBoxLayout()
+        # Right column: sliders only — wrapped in a widget so the HBoxLayout
+        # can stretch it properly.
+        right_col_widget = QWidget()
+        right_col_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        right_col = QVBoxLayout(right_col_widget)
         right_col.setSpacing(4)
         right_col.setContentsMargins(0, 0, 0, 0)
         right_col.addWidget(cam_form_widget)
+        right_col.addStretch()
 
+        orbit_row.addWidget(right_col_widget, stretch=1)
+        orbit_row.setAlignment(Qt.AlignTop)
+        layout.addLayout(orbit_row)
+
+        # Preset buttons span the full content width so they never force the
+        # right column (and therefore the orbit row) to be too wide.
         preset_row = QHBoxLayout()
         preset_row.setSpacing(3)
         preset_row.setContentsMargins(0, 0, 0, 0)
@@ -1123,13 +1140,8 @@ class KritaiDocker(DockWidget):
             btn = QPushButton(name)
             btn.setToolTip(f"Azimuth {az}°, Elevation {el}°, Distance {dist}")
             btn.clicked.connect(lambda checked=False, a=az, e=el, d=dist: self._apply_angle_preset(a, e, d))
-            preset_row.addWidget(btn)
-        right_col.addLayout(preset_row)
-        right_col.addStretch()
-
-        orbit_row.addLayout(right_col, stretch=1)
-        orbit_row.setAlignment(Qt.AlignTop)
-        layout.addLayout(orbit_row)
+            preset_row.addWidget(btn, stretch=1)
+        layout.addLayout(preset_row)
 
         # --- Settings form ---
         settings_widget = QWidget()
@@ -1138,6 +1150,21 @@ class KritaiDocker(DockWidget):
         form.setSpacing(4)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setHorizontalSpacing(20)
+
+        self._angle_model = QComboBox()
+        angle_model_tooltips = {
+            "flux2-klein-4b":      "Distilled 4B model. Fast, no guidance.",
+            "flux2-klein-9b":      "Distilled 9B model. Higher quality, no guidance.",
+            "flux2-klein-base-4b": "Base 4B model. Slower, supports guidance.",
+            "flux2-klein-base-9b": "Base 9B model. Best quality, supports guidance.",
+        }
+        for m in ANGLE_MODELS:
+            self._angle_model.addItem(m)
+            idx = self._angle_model.count() - 1
+            self._angle_model.setItemData(idx, angle_model_tooltips.get(m, ""), Qt.ToolTipRole)
+        self._angle_model.setCurrentIndex(0)
+        self._angle_model.currentIndexChanged.connect(self._update_angle_tab_ui)
+        form.addRow("Model", self._angle_model)
 
         self._angle_quantize = QSpinBox()
         self._angle_quantize.setSpecialValueText("None")
@@ -1148,16 +1175,17 @@ class KritaiDocker(DockWidget):
 
         self._angle_steps = QSpinBox()
         self._angle_steps.setRange(1, 100)
-        self._angle_steps.setValue(4)
+        self._angle_steps.setValue(8)
         self._angle_steps.setToolTip("Number of denoising steps.")
         form.addRow("Steps", self._angle_steps)
 
         self._angle_guidance = QDoubleSpinBox()
         self._angle_guidance.setRange(0.0, 20.0)
         self._angle_guidance.setSingleStep(0.5)
-        self._angle_guidance.setValue(4.0)
+        self._angle_guidance.setValue(3.5)
         self._angle_guidance.setToolTip("Guidance scale (classifier-free guidance strength).")
         form.addRow("Guidance", self._angle_guidance)
+        self._angle_guidance_label = form.labelForField(self._angle_guidance)
 
         scale_row, self._angle_scale, self._angle_scale_spin = self._make_slider_row(
             0, 100, 50, "Scale of the canvas sent to mflux relative to its original size."
@@ -1170,7 +1198,7 @@ class KritaiDocker(DockWidget):
         layout.addWidget(settings_widget)
         layout.addStretch()
         content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-
+        self._update_angle_tab_ui()
         return content
 
     # ------------------------------------------------------------------
@@ -1245,28 +1273,33 @@ class KritaiDocker(DockWidget):
             self._gen_strength_label.setVisible(supports_strength)
 
     def _update_edit_tab_ui(self) -> None:
-        model_name = self._edit_model.currentText()
-        _, _, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
-            model_name, (None, None, True, True, False)
-        )
-        needs_ref = rest[0] if rest else False
-        self._edit_guidance.setVisible(supports_guidance)
+        is_base = "base" in self._edit_model.currentText()
+        self._edit_guidance.setVisible(is_base)
         if self._edit_guidance_label:
-            self._edit_guidance_label.setVisible(supports_guidance)
-        self._edit_strength_row.setVisible(supports_strength)
+            self._edit_guidance_label.setVisible(is_base)
+        self._edit_strength_row.setVisible(False)
         if self._edit_strength_label:
-            self._edit_strength_label.setVisible(supports_strength)
-        self._edit_ref_section.setVisible(needs_ref)
+            self._edit_strength_label.setVisible(False)
+        self._edit_ref_section.setVisible(True)
+
+    def _update_angle_tab_ui(self) -> None:
+        is_base = "base" in self._angle_model.currentText()
+        self._angle_guidance.setVisible(is_base)
+        if self._angle_guidance_label:
+            self._angle_guidance_label.setVisible(is_base)
 
     # ------------------------------------------------------------------
     # Angle helpers
     # ------------------------------------------------------------------
 
     def _build_angle_prompt(self) -> str:
-        az_desc = _snap_to_nearest_wrap(self._angle_azimuth.value(), AZIMUTH_MAP)
-        el_desc = _snap_to_nearest(self._angle_elevation.value(), ELEVATION_MAP)
+        az_desc   = _snap_to_nearest_wrap(self._angle_azimuth.value(), AZIMUTH_MAP)
+        el_desc   = _snap_to_nearest(self._angle_elevation.value(), ELEVATION_MAP)
         dist_desc = _snap_to_nearest(self._angle_distance.value(), DISTANCE_MAP)
-        return f"{az_desc}, {el_desc}, {dist_desc}"
+        return (
+            f"Show the subject from a {az_desc}, {el_desc}, {dist_desc}. "
+            f"Keep the same subject, style, lighting, and background."
+        )
 
     def _apply_angle_preset(self, azimuth: int, elevation: int, distance: int) -> None:
         self._angle_azimuth.setValue(azimuth)
@@ -1297,7 +1330,6 @@ class KritaiDocker(DockWidget):
         # Edit tab signals.
         for signal in [
             self._edit_prompt.textChanged,
-            self._edit_model.currentIndexChanged,
             self._edit_quantize.valueChanged,
             self._edit_steps.valueChanged,
             self._edit_guidance.valueChanged,
@@ -1310,6 +1342,7 @@ class KritaiDocker(DockWidget):
 
         # Angle tab signals.
         for signal in [
+            self._angle_model.currentIndexChanged,
             self._angle_azimuth.valueChanged,
             self._angle_elevation.valueChanged,
             self._angle_distance.valueChanged,
@@ -1338,7 +1371,6 @@ class KritaiDocker(DockWidget):
             self._gen_scale.valueChanged,
             self._gen_seed.valueChanged,
             self._gen_random_seed.toggled,
-            self._edit_model.currentIndexChanged,
             self._edit_quantize.valueChanged,
             self._edit_steps.valueChanged,
             self._edit_guidance.valueChanged,
@@ -1346,6 +1378,7 @@ class KritaiDocker(DockWidget):
             self._edit_scale.valueChanged,
             self._edit_seed.valueChanged,
             self._edit_random_seed.toggled,
+            self._angle_model.currentIndexChanged,
             self._angle_azimuth.valueChanged,
             self._angle_elevation.valueChanged,
             self._angle_distance.valueChanged,
@@ -1409,6 +1442,7 @@ class KritaiDocker(DockWidget):
                 ],
             },
             "angle": {
+                "model": self._angle_model.currentText(),
                 "azimuth": self._angle_azimuth.value(),
                 "elevation": self._angle_elevation.value(),
                 "distance": self._angle_distance.value(),
@@ -1488,9 +1522,10 @@ class KritaiDocker(DockWidget):
             self._gen_prompt, self._gen_model,
             self._gen_quantize, self._gen_steps, self._gen_guidance,
             self._gen_strength, self._gen_scale, self._gen_seed, self._gen_random_seed,
-            self._edit_prompt, self._edit_model,
+            self._edit_prompt,
             self._edit_quantize, self._edit_steps, self._edit_guidance,
             self._edit_strength, self._edit_scale, self._edit_seed, self._edit_random_seed,
+            self._angle_model,
             self._angle_azimuth, self._angle_azimuth_spin,
             self._angle_elevation, self._angle_elevation_spin,
             self._angle_distance, self._angle_distance_spin,
@@ -1508,7 +1543,7 @@ class KritaiDocker(DockWidget):
         if idx >= 0:
             self._gen_model.setCurrentIndex(idx)
         self._gen_quantize.setValue(gen.get("quantize", 4))
-        self._gen_steps.setValue(gen.get("steps", 20))
+        self._gen_steps.setValue(gen.get("steps", 8))
         self._gen_guidance.setValue(gen.get("guidance", 3.5))
         sv = int(gen.get("strength", 0.75) * 100)
         self._gen_strength.setValue(sv)
@@ -1530,12 +1565,12 @@ class KritaiDocker(DockWidget):
 
         # --- Restore Edit tab ---
         edit = data.get("edit", {})
-        self._edit_prompt.setPlainText(edit.get("prompt", ""))
-        idx = self._edit_model.findText(edit.get("model", "flux2-edit"))
+        idx = self._edit_model.findText(edit.get("model", "flux2-klein-base-4b"))
         if idx >= 0:
             self._edit_model.setCurrentIndex(idx)
+        self._edit_prompt.setPlainText(edit.get("prompt", ""))
         self._edit_quantize.setValue(edit.get("quantize", 4))
-        self._edit_steps.setValue(edit.get("steps", 20))
+        self._edit_steps.setValue(edit.get("steps", 8))
         self._edit_guidance.setValue(edit.get("guidance", 3.5))
         sv = int(edit.get("strength", 0.75) * 100)
         self._edit_strength.setValue(sv)
@@ -1565,6 +1600,9 @@ class KritaiDocker(DockWidget):
 
         # --- Restore Angle tab ---
         angle = data.get("angle", {})
+        idx = self._angle_model.findText(angle.get("model", "flux2-klein-4b"))
+        if idx >= 0:
+            self._angle_model.setCurrentIndex(idx)
         az = angle.get("azimuth", 0)
         el = angle.get("elevation", 0)
         dv = angle.get("distance", 100)
@@ -1578,8 +1616,8 @@ class KritaiDocker(DockWidget):
         self._orbit.setElevation(el)
         self._orbit.setDistance(dv)
         self._angle_quantize.setValue(angle.get("quantize", 4))
-        self._angle_steps.setValue(angle.get("steps", 4))
-        self._angle_guidance.setValue(angle.get("guidance", 4.0))
+        self._angle_steps.setValue(angle.get("steps", 8))
+        self._angle_guidance.setValue(angle.get("guidance", 3.5))
         ascv = int(angle.get("scale", 0.5) * 100)
         self._angle_scale.setValue(ascv)
         self._angle_scale_spin.setValue(ascv / 100)
@@ -1609,6 +1647,7 @@ class KritaiDocker(DockWidget):
 
         self._update_generate_tab_ui()
         self._update_edit_tab_ui()
+        self._update_angle_tab_ui()
 
     def _migrate_old_settings(self, data: dict, uid: str) -> dict:
         """Migrate old flat settings format to new namespaced format."""
@@ -1616,7 +1655,7 @@ class KritaiDocker(DockWidget):
         common = {
             "prompt": data.get("prompt", ""),
             "quantize": data.get("quantize", 4),
-            "steps": data.get("steps", 20),
+            "steps": data.get("steps", 8),
             "guidance": data.get("guidance", 3.5),
             "strength": data.get("strength", 0.75),
             "scale": data.get("scale", data.get("downscale", data.get("resolution_scale", 0.5))),
@@ -1821,44 +1860,32 @@ class KritaiDocker(DockWidget):
 
     def _build_edit_cmd(self, prompt: str, doc: object) -> list[str]:
         model_name = self._edit_model.currentText()
-        cli_name, model_flag, supports_strength, supports_guidance, *rest = MODEL_CLI.get(
-            model_name, ("mflux-generate-flux2-edit", None, False, False, True)
-        )
-        needs_reference = rest[0] if rest else False
+        is_base = "base" in model_name
         scale = self._edit_scale.value() / 100
         target_w = max(1, int(doc.width() * scale))
         target_h = max(1, int(doc.height() * scale))
 
-        # Pre-scale the input image for edit models that don't accept --width/--height.
-        scale_input = needs_reference
-        if scale_input and abs(scale - 1.0) >= 0.001:
+        # flux2-edit uses --image-paths and doesn't support --width/--height,
+        # so pre-scale the input image when needed.
+        if abs(scale - 1.0) >= 0.001:
             img = QImage(self._tmp_input)
             if not img.isNull():
                 img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
 
-        cli_path = os.path.join(MFLUX_DIR, cli_name)
-        cmd = [cli_path, "--prompt", prompt]
-        if model_flag:
-            cmd += ["--model", model_flag]
+        cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
+        cmd = [cli_path, "--prompt", prompt, "--model", model_name]
 
-        if needs_reference:
-            cmd += ["--image-paths", self._tmp_input]
-            for enabled_cb, thumb, _, _ in self._edit_ref_entries:
-                if not enabled_cb.isChecked():
-                    continue
-                ref_path = (thumb.imagePath() or "").strip()
-                if ref_path:
-                    cmd.append(ref_path)
-        else:
-            cmd += ["--image-path", self._tmp_input]
+        cmd += ["--image-paths", self._tmp_input]
+        for enabled_cb, thumb, _, _ in self._edit_ref_entries:
+            if not enabled_cb.isChecked():
+                continue
+            ref_path = (thumb.imagePath() or "").strip()
+            if ref_path:
+                cmd.append(ref_path)
 
         cmd += ["--steps", str(self._edit_steps.value()), "--output", self._tmp_output]
-        if abs(scale - 1.0) >= 0.001 and not scale_input:
-            cmd += ["--width", str(target_w), "--height", str(target_h)]
-        if supports_guidance:
+        if is_base:
             cmd += ["--guidance", str(self._edit_guidance.value())]
-        if supports_strength:
-            cmd += ["--image-strength", str(self._edit_strength.value() / 100)]
         if self._edit_quantize.value() > 0:
             cmd += ["--quantize", str(self._edit_quantize.value())]
         if not self._edit_random_seed.isChecked():
@@ -1867,31 +1894,33 @@ class KritaiDocker(DockWidget):
         return cmd
 
     def _build_angle_cmd(self, prompt: str, doc: object) -> list[str]:
+        model_name = self._angle_model.currentText()
+        is_base = "base" in model_name
         scale = self._angle_scale.value() / 100
         target_w = max(1, int(doc.width() * scale))
         target_h = max(1, int(doc.height() * scale))
 
-        # Pre-scale for qwen-edit (doesn't accept --width/--height).
+        # flux2-edit uses --image-paths and doesn't support --width/--height,
+        # so pre-scale the input image when needed.
         if abs(scale - 1.0) >= 0.001:
             img = QImage(self._tmp_input)
             if not img.isNull():
                 img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
 
-        cli_path = os.path.join(MFLUX_DIR, "mflux-generate-qwen-edit")
+        cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
         cmd = [
             cli_path,
             "--prompt", prompt,
+            "--model", model_name,
             "--image-paths", self._tmp_input,
             "--steps", str(self._angle_steps.value()),
+            "--guidance", str(self._angle_guidance.value()) if is_base else "1.0",
             "--output", self._tmp_output,
         ]
         if self._angle_quantize.value() > 0:
             cmd += ["--quantize", str(self._angle_quantize.value())]
-        cmd += ["--guidance", str(self._angle_guidance.value())]
         if not self._angle_random_seed.isChecked():
             cmd += ["--seed", str(self._angle_seed.value())]
-        # Append angle LoRAs: lightning speed + multi-angle.
-        cmd += ["--lora-paths"] + ANGLE_LORA_PATHS + ["--lora-scales"] + ANGLE_LORA_SCALES
         return cmd
 
     def _build_edit_prompt(self) -> str:
@@ -1975,9 +2004,9 @@ class KritaiDocker(DockWidget):
         from PyQt5.QtCore import QSettings
         s = QSettings("kritai", "fill")
         return {
-            "strength": int(s.value("strength", 90)),
-            "steps": int(s.value("steps", 20)),
+            "model": str(s.value("model", "flux2-klein-base-4b")),
             "guidance": float(s.value("guidance", 3.5)),
+            "steps": int(s.value("steps", 8)),
             "quantize": int(s.value("quantize", 4)),
             "seed": int(s.value("seed", 0)),
             "random_seed": s.value("random_seed", "true") == "true",
@@ -2019,52 +2048,41 @@ class KritaiDocker(DockWidget):
         # --- Settings ---
         form = QFormLayout()
 
-        # Strength
-        strength_row = QWidget()
-        strength_layout = QHBoxLayout(strength_row)
-        strength_layout.setContentsMargins(0, 0, 0, 0)
-        strength_layout.setSpacing(6)
-        fill_strength = QSlider(Qt.Horizontal)
-        fill_strength.setRange(0, 100)
-        fill_strength.setValue(saved["strength"])
-        fill_strength_spin = QDoubleSpinBox()
-        fill_strength_spin.setRange(0.0, 1.0)
-        fill_strength_spin.setSingleStep(0.01)
-        fill_strength_spin.setDecimals(2)
-        fill_strength_spin.setValue(fill_strength.value() / 100)
-        fill_strength_spin.setFixedWidth(60)
-        fill_strength.valueChanged.connect(
-            lambda v: fill_strength_spin.setValue(v / 100)
-        )
-        fill_strength_spin.valueChanged.connect(
-            lambda v: fill_strength.setValue(int(v * 100))
-        )
-        strength_layout.addWidget(fill_strength)
-        strength_layout.addWidget(fill_strength_spin)
-        strength_row.setToolTip(
-            "How much the selection content influences the result.\n"
-            "0.0 = ignore existing content entirely.\n"
-            "1.0 = stay very close to what is already there.\n"
-            "Default: 0.90"
-        )
-        form.addRow("Strength", strength_row)
+        fill_model = QComboBox()
+        for m in ANGLE_MODELS:
+            fill_model.addItem(m)
+        saved_model = saved.get("model", "flux2-klein-base-4b")
+        idx = fill_model.findText(saved_model)
+        if idx >= 0:
+            fill_model.setCurrentIndex(idx)
+        form.addRow("Model", fill_model)
 
-        steps = QSpinBox()
-        steps.setRange(1, 100)
-        steps.setValue(saved["steps"])
-        form.addRow("Steps", steps)
+        fill_guidance = QDoubleSpinBox()
+        fill_guidance.setRange(0.0, 30.0)
+        fill_guidance.setSingleStep(0.5)
+        fill_guidance.setValue(saved.get("guidance", 3.5))
+        fill_guidance.setToolTip("How closely the result follows your prompt.")
+        fill_guidance_label = form.addRow("Guidance", fill_guidance)
 
-        guidance = QDoubleSpinBox()
-        guidance.setRange(0.0, 100.0)
-        guidance.setSingleStep(0.5)
-        guidance.setValue(saved["guidance"])
-        form.addRow("Guidance", guidance)
+        def _update_fill_guidance_visibility():
+            visible = "base" in fill_model.currentText()
+            fill_guidance.setVisible(visible)
+            lbl = form.labelForField(fill_guidance)
+            if lbl:
+                lbl.setVisible(visible)
+        fill_model.currentIndexChanged.connect(_update_fill_guidance_visibility)
+        _update_fill_guidance_visibility()
 
         quantize = QSpinBox()
         quantize.setSpecialValueText("None")
         quantize.setRange(0, 8)
         quantize.setValue(saved["quantize"])
         form.addRow("Quantize", quantize)
+
+        steps = QSpinBox()
+        steps.setRange(1, 100)
+        steps.setValue(saved["steps"])
+        form.addRow("Steps", steps)
 
         seed_row = QWidget()
         seed_layout = QHBoxLayout(seed_row)
@@ -2106,9 +2124,9 @@ class KritaiDocker(DockWidget):
 
             # Save settings at Krita level.
             self._save_fill_settings({
-                "strength": fill_strength.value(),
+                "model": fill_model.currentText(),
+                "guidance": fill_guidance.value(),
                 "steps": steps.value(),
-                "guidance": guidance.value(),
                 "quantize": quantize.value(),
                 "seed": dlg_seed.value(),
                 "random_seed": dlg_random_seed.isChecked(),
@@ -2140,19 +2158,20 @@ class KritaiDocker(DockWidget):
                 except OSError:
                     pass
 
-            # Build command — always Kontext dev.
-            cli_path = os.path.join(MFLUX_DIR, "mflux-generate-kontext")
+            # Build command — flux2-edit (Apache 2.0, commercially safe).
+            cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
+            fill_is_base = "base" in fill_model.currentText()
 
             cmd = [
                 cli_path,
                 "--prompt", prompt,
-                "--model", "dev",
-                "--image-path", tmp_in_path,
-                "--image-strength", str(fill_strength.value() / 100),
+                "--model", fill_model.currentText(),
+                "--image-paths", tmp_in_path,
                 "--steps", str(steps.value()),
-                "--guidance", str(guidance.value()),
                 "--output", tmp_out,
             ]
+            if fill_is_base:
+                cmd += ["--guidance", str(fill_guidance.value())]
 
             if quantize.value() > 0:
                 cmd += ["--quantize", str(quantize.value())]
