@@ -850,15 +850,7 @@ class KritaiDocker(DockWidget):
 
         form.addRow("Model", self._gen_model)
 
-        self._gen_quantize = QSpinBox()
-        self._gen_quantize.setSpecialValueText("None")
-        self._gen_quantize.setRange(0, 8)
-        self._gen_quantize.setValue(4)
-        self._gen_quantize.setToolTip(
-            "Reduces model weight precision to save memory and speed up generation.\n"
-            "4 is a good balance of quality and speed.\n"
-            "Higher = better quality, more RAM. 0 = no quantization (full precision)."
-        )
+        self._gen_quantize = self._make_quantize_combo()
         form.addRow("Quantize", self._gen_quantize)
 
         self._gen_steps = QSpinBox()
@@ -937,9 +929,7 @@ class KritaiDocker(DockWidget):
         # --- Prompt ---
         self._edit_prompt = QPlainTextEdit()
         self._edit_prompt.setPlaceholderText("Prompt...")
-        self._edit_prompt.setToolTip("Describe what you want to change in the image.")
         self._edit_prompt.setFixedHeight(60)
-
 
         # --- Settings form ---
         settings_widget = QWidget()
@@ -948,6 +938,17 @@ class KritaiDocker(DockWidget):
         form.setSpacing(4)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setHorizontalSpacing(20)
+
+        self._edit_image_source = QComboBox()
+        self._edit_image_source.addItem("Canvas")
+        self._edit_image_source.addItem("References")
+        self._edit_image_source.setToolTip(
+            "Canvas: edit the current canvas using reference images as conditioning.\n"
+            "References: generate from scratch using reference images for style guidance."
+        )
+        self._edit_image_source.currentIndexChanged.connect(self._update_edit_tab_ui)
+        self._edit_image_source.currentIndexChanged.connect(self._save_settings)
+        form.addRow("Image Source", self._edit_image_source)
 
         self._edit_model = QComboBox()
         edit_model_tooltips = {
@@ -964,14 +965,7 @@ class KritaiDocker(DockWidget):
         self._edit_model.currentIndexChanged.connect(self._update_edit_tab_ui)
         form.addRow("Model", self._edit_model)
 
-        self._edit_quantize = QSpinBox()
-        self._edit_quantize.setSpecialValueText("None")
-        self._edit_quantize.setRange(0, 8)
-        self._edit_quantize.setValue(4)
-        self._edit_quantize.setToolTip(
-            "Reduces model weight precision to save memory and speed up generation.\n"
-            "4 is a good balance of quality and speed."
-        )
+        self._edit_quantize = self._make_quantize_combo()
         form.addRow("Quantize", self._edit_quantize)
 
         self._edit_steps = QSpinBox()
@@ -1167,11 +1161,7 @@ class KritaiDocker(DockWidget):
         self._angle_model.currentIndexChanged.connect(self._update_angle_tab_ui)
         form.addRow("Model", self._angle_model)
 
-        self._angle_quantize = QSpinBox()
-        self._angle_quantize.setSpecialValueText("None")
-        self._angle_quantize.setRange(0, 8)
-        self._angle_quantize.setValue(4)
-        self._angle_quantize.setToolTip("Quantize level for the model.")
+        self._angle_quantize = self._make_quantize_combo()
         form.addRow("Quantize", self._angle_quantize)
 
         self._angle_steps = QSpinBox()
@@ -1275,6 +1265,7 @@ class KritaiDocker(DockWidget):
 
     def _update_edit_tab_ui(self) -> None:
         is_base = "base" in self._edit_model.currentText()
+        is_canvas = self._edit_image_source.currentText() == "Canvas"
         self._edit_guidance.setVisible(is_base)
         if self._edit_guidance_label:
             self._edit_guidance_label.setVisible(is_base)
@@ -1282,6 +1273,14 @@ class KritaiDocker(DockWidget):
         if self._edit_strength_label:
             self._edit_strength_label.setVisible(False)
         self._edit_ref_section.setVisible(True)
+        self._edit_scale.setEnabled(is_canvas)
+        self._edit_scale_spin.setEnabled(is_canvas)
+        if is_canvas:
+            self._edit_prompt.setPlaceholderText("Describe what you want to change...")
+            self._edit_prompt.setToolTip("Describe what you want to change in the canvas.")
+        else:
+            self._edit_prompt.setPlaceholderText("Describe what you want to generate...")
+            self._edit_prompt.setToolTip("Describe the image to generate, drawing style from the reference images.")
 
     def _update_angle_tab_ui(self) -> None:
         is_base = "base" in self._angle_model.currentText()
@@ -1318,7 +1317,7 @@ class KritaiDocker(DockWidget):
         for signal in [
             self._gen_prompt.textChanged,
             self._gen_model.currentIndexChanged,
-            self._gen_quantize.valueChanged,
+            self._gen_quantize.currentIndexChanged,
             self._gen_steps.valueChanged,
             self._gen_guidance.valueChanged,
             self._gen_strength.valueChanged,
@@ -1331,7 +1330,7 @@ class KritaiDocker(DockWidget):
         # Edit tab signals.
         for signal in [
             self._edit_prompt.textChanged,
-            self._edit_quantize.valueChanged,
+            self._edit_quantize.currentIndexChanged,
             self._edit_steps.valueChanged,
             self._edit_guidance.valueChanged,
             self._edit_strength.valueChanged,
@@ -1347,7 +1346,7 @@ class KritaiDocker(DockWidget):
             self._angle_azimuth.valueChanged,
             self._angle_elevation.valueChanged,
             self._angle_distance.valueChanged,
-            self._angle_quantize.valueChanged,
+            self._angle_quantize.currentIndexChanged,
             self._angle_steps.valueChanged,
             self._angle_guidance.valueChanged,
             self._angle_scale.valueChanged,
@@ -1365,14 +1364,14 @@ class KritaiDocker(DockWidget):
 
         for signal in [
             self._gen_model.currentIndexChanged,
-            self._gen_quantize.valueChanged,
+            self._gen_quantize.currentIndexChanged,
             self._gen_steps.valueChanged,
             self._gen_guidance.valueChanged,
             self._gen_strength.valueChanged,
             self._gen_scale.valueChanged,
             self._gen_seed.valueChanged,
             self._gen_random_seed.toggled,
-            self._edit_quantize.valueChanged,
+            self._edit_quantize.currentIndexChanged,
             self._edit_steps.valueChanged,
             self._edit_guidance.valueChanged,
             self._edit_strength.valueChanged,
@@ -1383,7 +1382,7 @@ class KritaiDocker(DockWidget):
             self._angle_azimuth.valueChanged,
             self._angle_elevation.valueChanged,
             self._angle_distance.valueChanged,
-            self._angle_quantize.valueChanged,
+            self._angle_quantize.currentIndexChanged,
             self._angle_steps.valueChanged,
             self._angle_guidance.valueChanged,
             self._angle_scale.valueChanged,
@@ -1410,7 +1409,7 @@ class KritaiDocker(DockWidget):
             "generate": {
                 "model": self._gen_model.currentText(),
                 "prompt": self._gen_prompt.toPlainText(),
-                "quantize": self._gen_quantize.value(),
+                "quantize": self._quantize_value(self._gen_quantize),
                 "steps": self._gen_steps.value(),
                 "guidance": self._gen_guidance.value(),
                 "strength": self._gen_strength.value() / 100,
@@ -1423,9 +1422,10 @@ class KritaiDocker(DockWidget):
                 ],
             },
             "edit": {
+                "image_source": self._edit_image_source.currentText(),
                 "model": self._edit_model.currentText(),
                 "prompt": self._edit_prompt.toPlainText(),
-                "quantize": self._edit_quantize.value(),
+                "quantize": self._quantize_value(self._edit_quantize),
                 "steps": self._edit_steps.value(),
                 "guidance": self._edit_guidance.value(),
                 "strength": self._edit_strength.value() / 100,
@@ -1433,9 +1433,9 @@ class KritaiDocker(DockWidget):
                 "seed": self._edit_seed.value(),
                 "random_seed": self._edit_random_seed.isChecked(),
                 "reference_images": [
-                    {"path": t.imagePath() or "", "prompt": p.text().strip(), "enabled": e.isChecked()}
-                    for e, t, p, _ in self._edit_ref_entries
-                    if (t.imagePath() or "").strip() or p.text().strip()
+                    {"path": t.imagePath() or "", "enabled": e.isChecked()}
+                    for e, t, _ in self._edit_ref_entries
+                    if (t.imagePath() or "").strip()
                 ],
                 "loras": [
                     {"path": p.text().strip(), "scale": s.value(), "enabled": e.isChecked()}
@@ -1447,7 +1447,7 @@ class KritaiDocker(DockWidget):
                 "azimuth": self._angle_azimuth.value(),
                 "elevation": self._angle_elevation.value(),
                 "distance": self._angle_distance.value(),
-                "quantize": self._angle_quantize.value(),
+                "quantize": self._quantize_value(self._angle_quantize),
                 "steps": self._angle_steps.value(),
                 "guidance": self._angle_guidance.value(),
                 "scale": self._angle_scale.value() / 100,
@@ -1543,7 +1543,7 @@ class KritaiDocker(DockWidget):
         idx = self._gen_model.findText(gen.get("model", "flux2-klein-4b"))
         if idx >= 0:
             self._gen_model.setCurrentIndex(idx)
-        self._gen_quantize.setValue(gen.get("quantize", 4))
+        self._set_quantize_combo(self._gen_quantize, gen.get("quantize", 4))
         self._gen_steps.setValue(gen.get("steps", 8))
         self._gen_guidance.setValue(gen.get("guidance", 3.5))
         sv = int(gen.get("strength", 0.75) * 100)
@@ -1566,11 +1566,14 @@ class KritaiDocker(DockWidget):
 
         # --- Restore Edit tab ---
         edit = data.get("edit", {})
+        src_idx = self._edit_image_source.findText(edit.get("image_source", "Canvas"))
+        if src_idx >= 0:
+            self._edit_image_source.setCurrentIndex(src_idx)
         idx = self._edit_model.findText(edit.get("model", "flux2-klein-base-4b"))
         if idx >= 0:
             self._edit_model.setCurrentIndex(idx)
         self._edit_prompt.setPlainText(edit.get("prompt", ""))
-        self._edit_quantize.setValue(edit.get("quantize", 4))
+        self._set_quantize_combo(self._edit_quantize, edit.get("quantize", 4))
         self._edit_steps.setValue(edit.get("steps", 8))
         self._edit_guidance.setValue(edit.get("guidance", 3.5))
         sv = int(edit.get("strength", 0.75) * 100)
@@ -1589,7 +1592,7 @@ class KritaiDocker(DockWidget):
         self._edit_ref_entries.clear()
         for ref in edit.get("reference_images", []):
             self._add_ref_row(self._edit_ref_entries, self._edit_ref_list,
-                              ref.get("path", ""), ref.get("prompt", ""), ref.get("enabled", True))
+                              ref.get("path", ""), ref.get("enabled", True))
         # Restore edit LoRAs.
         for *_, row in list(self._edit_lora_entries):
             self._edit_lora_list.removeWidget(row)
@@ -1616,7 +1619,7 @@ class KritaiDocker(DockWidget):
         self._orbit.setAzimuth(az)
         self._orbit.setElevation(el)
         self._orbit.setDistance(dv)
-        self._angle_quantize.setValue(angle.get("quantize", 4))
+        self._set_quantize_combo(self._angle_quantize, angle.get("quantize", 4))
         self._angle_steps.setValue(angle.get("steps", 8))
         self._angle_guidance.setValue(angle.get("guidance", 3.5))
         ascv = int(angle.get("scale", 0.5) * 100)
@@ -1732,6 +1735,15 @@ class KritaiDocker(DockWidget):
             self._generate_btn.setEnabled(False)
             self._generate_btn.setToolTip("Enter a prompt to generate.")
             return
+        if tab == 1 and self._edit_image_source.currentText() == "References":
+            has_ref = any(
+                enabled_cb.isChecked() and (thumb.imagePath() or "").strip()
+                for enabled_cb, thumb, _ in self._edit_ref_entries
+            )
+            if not has_ref:
+                self._generate_btn.setEnabled(False)
+                self._generate_btn.setToolTip("Add at least one reference image.")
+                return
         self._generate_btn.setEnabled(True)
         self._generate_btn.setToolTip("Generate an image from the current canvas and prompt.")
 
@@ -1855,8 +1867,8 @@ class KritaiDocker(DockWidget):
             cmd += ["--guidance", str(self._gen_guidance.value())]
         if supports_strength:
             cmd += ["--image-strength", str(self._gen_strength.value() / 100)]
-        if self._gen_quantize.value() > 0:
-            cmd += ["--quantize", str(self._gen_quantize.value())]
+        if (q := self._quantize_value(self._gen_quantize)) is not None:
+            cmd += ["--quantize", str(q)]
         if not self._gen_random_seed.isChecked():
             cmd += ["--seed", str(self._gen_seed.value())]
         cmd += self._get_lora_args(self._gen_lora_entries)
@@ -1869,18 +1881,22 @@ class KritaiDocker(DockWidget):
         target_w = max(1, int(doc.width() * scale))
         target_h = max(1, int(doc.height() * scale))
 
-        # flux2-edit uses --image-paths and doesn't support --width/--height,
-        # so pre-scale the input image when needed.
-        if abs(scale - 1.0) >= 0.001:
+        is_canvas = self._edit_image_source.currentText() == "Canvas"
+
+        # flux2-edit supports --width/--height but dimensions default to the first image
+        # when set to "auto". Pre-scale the canvas so the output matches the document size.
+        if is_canvas and abs(scale - 1.0) >= 0.001:
             img = QImage(self._tmp_input)
             if not img.isNull():
                 img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
 
         cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
         cmd = [cli_path, "--prompt", prompt, "--model", model_name]
-
-        cmd += ["--image-paths", self._tmp_input]
-        for enabled_cb, thumb, _, _ in self._edit_ref_entries:
+        if is_canvas:
+            cmd += ["--image-paths", self._tmp_input]
+        else:
+            cmd += ["--image-paths"]
+        for enabled_cb, thumb, _ in self._edit_ref_entries:
             if not enabled_cb.isChecked():
                 continue
             ref_path = (thumb.imagePath() or "").strip()
@@ -1890,8 +1906,8 @@ class KritaiDocker(DockWidget):
         cmd += ["--steps", str(self._edit_steps.value()), "--output", self._tmp_output]
         if is_base:
             cmd += ["--guidance", str(self._edit_guidance.value())]
-        if self._edit_quantize.value() > 0:
-            cmd += ["--quantize", str(self._edit_quantize.value())]
+        if (q := self._quantize_value(self._edit_quantize)) is not None:
+            cmd += ["--quantize", str(q)]
         if not self._edit_random_seed.isChecked():
             cmd += ["--seed", str(self._edit_seed.value())]
         cmd += self._get_lora_args(self._edit_lora_entries)
@@ -1921,28 +1937,14 @@ class KritaiDocker(DockWidget):
             "--guidance", str(self._angle_guidance.value()) if is_base else "1.0",
             "--output", self._tmp_output,
         ]
-        if self._angle_quantize.value() > 0:
-            cmd += ["--quantize", str(self._angle_quantize.value())]
+        if (q := self._quantize_value(self._angle_quantize)) is not None:
+            cmd += ["--quantize", str(q)]
         if not self._angle_random_seed.isChecked():
             cmd += ["--seed", str(self._angle_seed.value())]
         return cmd
 
     def _build_edit_prompt(self) -> str:
-        """Assemble the edit tab prompt with per-reference-image descriptions."""
-        parts: list[str] = []
-        main = self._edit_prompt.toPlainText().strip()
-        if main:
-            parts.append(main)
-        idx = 0
-        for enabled_cb, thumb, prompt_edit, _ in self._edit_ref_entries:
-            if not enabled_cb.isChecked():
-                continue
-            ref_path = (thumb.imagePath() or "").strip()
-            ref_prompt = prompt_edit.text().strip()
-            if ref_path and ref_prompt:
-                idx += 1
-                parts.append(f"Reference image {idx}: {ref_prompt}")
-        return "\n".join(parts)
+        return self._edit_prompt.toPlainText().strip()
 
     def _on_finished(self, output_path: str) -> None:
         self._set_busy(False)
@@ -2100,14 +2102,13 @@ class KritaiDocker(DockWidget):
         softness_row.setToolTip("0.0 = off, 1.0 = maximum softness.")
         upscale_form.addRow("Softness", softness_row)
 
-        quantize = QSpinBox()
-        quantize.setSpecialValueText("None")
-        quantize.setRange(0, 8)
         # Use active tab's quantize as default.
-        default_q = self._gen_quantize.value() if tab == 0 else (
-            self._edit_quantize.value() if tab == 1 else self._angle_quantize.value()
+        default_q = self._quantize_value(self._gen_quantize) if tab == 0 else (
+            self._quantize_value(self._edit_quantize) if tab == 1 else self._quantize_value(self._angle_quantize)
         )
-        quantize.setValue(saved.get("quantize", default_q))
+        quantize = self._make_quantize_combo(default=default_q or 4)
+        saved_q = saved.get("quantize")
+        self._set_quantize_combo(quantize, saved_q if saved_q is not None else default_q)
         upscale_form.addRow("Quantize", quantize)
 
         seed_row = QWidget()
@@ -2142,7 +2143,7 @@ class KritaiDocker(DockWidget):
         def save_upscale_settings():
             self._upscale_settings[uid] = {
                 "softness": softness.value(),
-                "quantize": quantize.value(),
+                "quantize": self._quantize_value(quantize),
                 "seed": dlg_seed.value(),
                 "random_seed": dlg_random_seed.isChecked(),
             }
@@ -2180,8 +2181,8 @@ class KritaiDocker(DockWidget):
             if softness.value() > 0:
                 cmd += ["--softness", str(softness.value() / 100)]
 
-            if quantize.value() > 0:
-                cmd += ["--quantize", str(quantize.value())]
+            if (q := self._quantize_value(quantize)) is not None:
+                cmd += ["--quantize", str(q)]
             if not dlg_random_seed.isChecked():
                 cmd += ["--seed", str(dlg_seed.value())]
 
@@ -2327,9 +2328,34 @@ class KritaiDocker(DockWidget):
             return []
         return ["--lora-paths"] + paths + ["--lora-scales"] + scales
 
+    _QUANTIZE_CHOICES = [None, 3, 4, 5, 6, 8]
+
+    def _make_quantize_combo(self, default: int = 4) -> QComboBox:
+        combo = QComboBox()
+        combo.setToolTip(
+            "Reduces model weight precision to save memory and speed up generation.\n"
+            "4 is a good balance of quality and speed. None = full precision."
+        )
+        for v in self._QUANTIZE_CHOICES:
+            combo.addItem("None" if v is None else str(v))
+        self._set_quantize_combo(combo, default)
+        return combo
+
+    @staticmethod
+    def _quantize_value(combo: QComboBox) -> int | None:
+        text = combo.currentText()
+        return None if text == "None" else int(text)
+
+    @staticmethod
+    def _set_quantize_combo(combo: QComboBox, value: int | None) -> None:
+        target = "None" if value is None else str(value)
+        idx = combo.findText(target)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
     def _add_ref_row(self, entries_list: list, ref_layout: QVBoxLayout,
-                     path: str = "", prompt: str = "", enabled: bool = True) -> None:
-        """Add a reference image entry with enable checkbox, thumbnail, prompt, and remove button."""
+                     path: str = "", enabled: bool = True) -> None:
+        """Add a reference image entry with enable checkbox, thumbnail, and remove button."""
         row = QWidget()
         row_layout = QHBoxLayout(row)
         row_layout.setContentsMargins(0, 0, 0, 0)
@@ -2343,10 +2369,6 @@ class KritaiDocker(DockWidget):
         if path:
             thumb.setImagePath(path)
 
-        prompt_edit = QLineEdit()
-        prompt_edit.setPlaceholderText("Describe this reference...")
-        prompt_edit.setText(prompt)
-
         remove_btn = QPushButton("×")
         remove_btn.setFixedWidth(22)
         remove_btn.clicked.connect(
@@ -2354,16 +2376,14 @@ class KritaiDocker(DockWidget):
         )
 
         row_layout.addWidget(enabled_cb)
-        row_layout.addWidget(thumb)
-        row_layout.addWidget(prompt_edit, 1)
+        row_layout.addWidget(thumb, 1)
         row_layout.addWidget(remove_btn)
 
-        prompt_edit.textChanged.connect(self._update_generate_btn)
         enabled_cb.toggled.connect(self._update_generate_btn)
         thumb.pathChanged.connect(self._update_generate_btn)
 
         ref_layout.addWidget(row)
-        entries_list.append((enabled_cb, thumb, prompt_edit, row))
+        entries_list.append((enabled_cb, thumb, row))
         self._update_generate_btn()
 
     def _remove_ref_row(self, entries_list: list, ref_layout: QVBoxLayout, row: QWidget) -> None:
