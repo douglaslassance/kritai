@@ -939,17 +939,6 @@ class KritaiDocker(DockWidget):
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setHorizontalSpacing(20)
 
-        self._edit_image_source = QComboBox()
-        self._edit_image_source.addItem("Canvas")
-        self._edit_image_source.addItem("References")
-        self._edit_image_source.setToolTip(
-            "Canvas: edit the current canvas using reference images as conditioning.\n"
-            "References: generate from scratch using reference images for style guidance."
-        )
-        self._edit_image_source.currentIndexChanged.connect(self._update_edit_tab_ui)
-        self._edit_image_source.currentIndexChanged.connect(self._save_settings)
-        form.addRow("Image Source", self._edit_image_source)
-
         self._edit_model = QComboBox()
         edit_model_tooltips = {
             "flux2-klein-4b":      "Distilled 4B model. Fast, no guidance.",
@@ -1265,7 +1254,6 @@ class KritaiDocker(DockWidget):
 
     def _update_edit_tab_ui(self) -> None:
         is_base = "base" in self._edit_model.currentText()
-        is_canvas = self._edit_image_source.currentText() == "Canvas"
         self._edit_guidance.setVisible(is_base)
         if self._edit_guidance_label:
             self._edit_guidance_label.setVisible(is_base)
@@ -1273,14 +1261,8 @@ class KritaiDocker(DockWidget):
         if self._edit_strength_label:
             self._edit_strength_label.setVisible(False)
         self._edit_ref_section.setVisible(True)
-        self._edit_scale.setEnabled(is_canvas)
-        self._edit_scale_spin.setEnabled(is_canvas)
-        if is_canvas:
-            self._edit_prompt.setPlaceholderText("Describe what you want to change...")
-            self._edit_prompt.setToolTip("Describe what you want to change in the canvas.")
-        else:
-            self._edit_prompt.setPlaceholderText("Describe what you want to generate...")
-            self._edit_prompt.setToolTip("Describe the image to generate, drawing style from the reference images.")
+        self._edit_prompt.setPlaceholderText("Describe what you want to change...")
+        self._edit_prompt.setToolTip("Describe what you want to change in the canvas.")
 
     def _update_angle_tab_ui(self) -> None:
         is_base = "base" in self._angle_model.currentText()
@@ -1422,7 +1404,6 @@ class KritaiDocker(DockWidget):
                 ],
             },
             "edit": {
-                "image_source": self._edit_image_source.currentText(),
                 "model": self._edit_model.currentText(),
                 "prompt": self._edit_prompt.toPlainText(),
                 "quantize": self._quantize_value(self._edit_quantize),
@@ -1566,9 +1547,6 @@ class KritaiDocker(DockWidget):
 
         # --- Restore Edit tab ---
         edit = data.get("edit", {})
-        src_idx = self._edit_image_source.findText(edit.get("image_source", "Canvas"))
-        if src_idx >= 0:
-            self._edit_image_source.setCurrentIndex(src_idx)
         idx = self._edit_model.findText(edit.get("model", "flux2-klein-base-4b"))
         if idx >= 0:
             self._edit_model.setCurrentIndex(idx)
@@ -1735,15 +1713,6 @@ class KritaiDocker(DockWidget):
             self._generate_btn.setEnabled(False)
             self._generate_btn.setToolTip("Enter a prompt to generate.")
             return
-        if tab == 1 and self._edit_image_source.currentText() == "References":
-            has_ref = any(
-                enabled_cb.isChecked() and (thumb.imagePath() or "").strip()
-                for enabled_cb, thumb, _ in self._edit_ref_entries
-            )
-            if not has_ref:
-                self._generate_btn.setEnabled(False)
-                self._generate_btn.setToolTip("Add at least one reference image.")
-                return
         self._generate_btn.setEnabled(True)
         self._generate_btn.setToolTip("Generate an image from the current canvas and prompt.")
 
@@ -1822,10 +1791,14 @@ class KritaiDocker(DockWidget):
                 bounds = _export_selection_crop(doc, self._tmp_input)
                 if bounds:
                     self._edit_selection_bounds = bounds
+                    _sx, _sy, _sw, _sh = bounds
+                    if _sw > 0:
+                        self._preview.setRatio(_sh / _sw)
                 else:
                     self._export_canvas(doc, self._tmp_input)
             else:
                 self._export_canvas(doc, self._tmp_input)
+                self._update_preview_ratio(doc)
         else:
             self._export_canvas(doc, self._tmp_input)
 
@@ -1881,21 +1854,16 @@ class KritaiDocker(DockWidget):
         target_w = max(1, int(doc.width() * scale))
         target_h = max(1, int(doc.height() * scale))
 
-        is_canvas = self._edit_image_source.currentText() == "Canvas"
-
         # flux2-edit supports --width/--height but dimensions default to the first image
         # when set to "auto". Pre-scale the canvas so the output matches the document size.
-        if is_canvas and abs(scale - 1.0) >= 0.001:
+        if abs(scale - 1.0) >= 0.001:
             img = QImage(self._tmp_input)
             if not img.isNull():
                 img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
 
         cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
         cmd = [cli_path, "--prompt", prompt, "--model", model_name]
-        if is_canvas:
-            cmd += ["--image-paths", self._tmp_input]
-        else:
-            cmd += ["--image-paths"]
+        cmd += ["--image-paths", self._tmp_input]
         for enabled_cb, thumb, _ in self._edit_ref_entries:
             if not enabled_cb.isChecked():
                 continue
@@ -1961,23 +1929,8 @@ class KritaiDocker(DockWidget):
         self._time_label.setVisible(True)
         self._progress.setVisible(False)
 
-        if self._edit_selection_bounds and self._current_doc:
-            sx, sy, sw, sh = self._edit_selection_bounds
+        if self._edit_selection_bounds:
             self._edit_selection_bounds = None
-            result_img = QImage(output_path)
-            if not result_img.isNull():
-                result_img = result_img.convertToFormat(QImage.Format_ARGB32)
-                if result_img.width() != sw or result_img.height() != sh:
-                    result_img = result_img.scaled(
-                        sw, sh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-                    )
-                doc = self._current_doc
-                layer = doc.createNode("Kritai Edit", "paintlayer")
-                doc.rootNode().addChildNode(layer, None)
-                ptr = result_img.bits()
-                ptr.setsize(result_img.byteCount())
-                layer.setPixelData(bytes(ptr), sx, sy, sw, sh)
-                doc.refreshProjection()
 
     def _on_error(self, message: str) -> None:
         self._set_busy(False)
