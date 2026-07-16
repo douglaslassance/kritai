@@ -52,28 +52,18 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-MFLUX_DIR = os.path.expanduser("~/.local/bin")
-
-# Maps model name → (cli_binary, model_flag, supports_strength, supports_guidance, needs_reference_image).
-# Distilled models (klein, schnell) don't accept a variable guidance scale.
-# Models with needs_reference_image=True use --image-paths [canvas, ref…] instead of --image-path canvas.
-MODEL_CLI = {
-    # FLUX.2 — distilled variants: no guidance; base variants: guidance ok
-    "flux2-klein-4b":      ("mflux-generate-flux2",      "flux2-klein-4b",      True,  False, False),
-    "flux2-klein-9b":      ("mflux-generate-flux2",      "flux2-klein-9b",      True,  False, False),
-    "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True,  False),
-    "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
-    # FLUX.2 edit — canvas + optional reference image via --image-paths.
-    # Model is chosen at runtime via the Edit tab's model selector.
-    "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, True,  True),
-}
-
-# Which models belong to which tab.
-GENERATE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
-EDIT_MODELS = ["flux2-edit"]
-
-# Models available in the Angle tab (must be compatible with mflux-generate-flux2-edit).
-ANGLE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
+from .providers import (
+    ANGLE_MODELS,
+    EDIT_MODELS,
+    GENERATE_MODELS,
+    MFLUX_DIR,
+    MODEL_CLI,
+    PROVIDER_FAL,
+    PROVIDER_LABELS,
+    PROVIDER_LOCAL,
+    GenerationRequest,
+    make_provider,
+)
 
 AZIMUTH_MAP = [
     (0,    "front view"),
@@ -610,6 +600,33 @@ class GenerateThread(QThread):
             self.errored.emit(str(e))
 
 
+class ProviderThread(QThread):
+    """Runs a GenerationRequest through a provider (local mflux or cloud fal.ai)."""
+
+    finished = pyqtSignal(str)        # output path
+    errored = pyqtSignal(str)         # error message
+    logged = pyqtSignal(str)          # line of log output
+    progress = pyqtSignal(int)        # 0–100
+
+    def __init__(self, provider, request: GenerationRequest) -> None:
+        super().__init__()
+        self.provider = provider
+        self.request = request
+
+    def run(self) -> None:
+        try:
+            self.provider.run(
+                self.request,
+                log=lambda line: self.logged.emit(line),
+                progress=lambda pct: self.progress.emit(pct),
+            )
+        except Exception as e:
+            self.logged.emit(str(e))
+            self.errored.emit(str(e))
+            return
+        self.finished.emit(self.request.output_path)
+
+
 class _FocusOutSignal(QObject):
     """Emits focusLost when the watched widget loses focus."""
     focusLost = pyqtSignal()
@@ -645,7 +662,7 @@ class KritaiDocker(DockWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Kritai")
-        self._thread: Optional[GenerateThread] = None
+        self._thread: Optional[QThread] = None
         self._tmp_input: Optional[str] = None
         self._tmp_output: Optional[str] = None
         self._last_canvas_hash: Optional[str] = None
@@ -654,6 +671,12 @@ class KritaiDocker(DockWidget):
         self._doc_settings: dict[str, dict] = {}
         self._upscale_settings: dict[str, dict] = {}
         self._edit_selection_bounds: Optional[tuple] = None
+
+        # Backend (mflux local vs fal.ai cloud) — app-global, stored in Krita's
+        # config rather than the per-document annotation since the API key is secret.
+        provider = Krita.instance().readSetting("kritai", "provider", PROVIDER_LOCAL)
+        self._provider_id = provider if provider in (PROVIDER_LOCAL, PROVIDER_FAL) else PROVIDER_LOCAL
+        self._fal_api_key = Krita.instance().readSetting("kritai", "fal_api_key", "") or ""
 
         # Flush settings to annotation on save and on application close.
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
@@ -804,9 +827,60 @@ class KritaiDocker(DockWidget):
         self._time_label.setVisible(False)
         outer.addWidget(self._time_label)
 
+        outer.addWidget(self._build_backend_section())
+
         outer.addStretch()
 
         self._update_generate_btn()
+
+    def _build_backend_section(self) -> QWidget:
+        box = QGroupBox("Backend")
+        form = QFormLayout(box)
+        form.setContentsMargins(8, 8, 8, 8)
+        form.setSpacing(6)
+
+        self._provider_combo = QComboBox()
+        self._provider_combo.setToolTip(
+            "Where to run the model.\n"
+            "Local (mflux): runs on this Mac, no cost, Apple Silicon only.\n"
+            "Cloud (fal.ai): runs the same models on fal.ai, works anywhere, needs an API key and bills per image."
+        )
+        for pid in (PROVIDER_LOCAL, PROVIDER_FAL):
+            self._provider_combo.addItem(PROVIDER_LABELS[pid], pid)
+        idx = self._provider_combo.findData(self._provider_id)
+        self._provider_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._provider_combo.currentIndexChanged.connect(self._on_provider_changed)
+        form.addRow("Run on", self._provider_combo)
+
+        self._fal_key_edit = QLineEdit()
+        self._fal_key_edit.setEchoMode(QLineEdit.Password)
+        self._fal_key_edit.setPlaceholderText("fal.ai API key")
+        self._fal_key_edit.setToolTip("Your fal.ai key. Get one at fal.ai/dashboard/keys.")
+        self._fal_key_edit.setText(self._fal_api_key)
+        self._fal_key_edit.editingFinished.connect(self._on_fal_key_changed)
+        self._fal_key_row_label = QLabel("fal.ai key")
+        form.addRow(self._fal_key_row_label, self._fal_key_edit)
+
+        self._backend_box = box
+        self._update_backend_ui()
+        return box
+
+    def _current_provider(self) -> str:
+        return self._provider_id
+
+    def _update_backend_ui(self) -> None:
+        show_key = self._provider_id == PROVIDER_FAL
+        self._fal_key_edit.setVisible(show_key)
+        self._fal_key_row_label.setVisible(show_key)
+
+    def _on_provider_changed(self) -> None:
+        self._provider_id = self._provider_combo.currentData() or PROVIDER_LOCAL
+        Krita.instance().writeSetting("kritai", "provider", self._provider_id)
+        self._update_backend_ui()
+
+    def _on_fal_key_changed(self) -> None:
+        self._fal_api_key = self._fal_key_edit.text().strip()
+        Krita.instance().writeSetting("kritai", "fal_api_key", self._fal_api_key)
 
     # ------------------------------------------------------------------
     # Tab builders
@@ -1803,113 +1877,93 @@ class KritaiDocker(DockWidget):
             self._export_canvas(doc, self._tmp_input)
 
         if tab == 0:
-            cmd = self._build_generate_cmd(prompt, doc)
+            request = self._build_generate_request(prompt, doc)
         elif tab == 1:
-            cmd = self._build_edit_cmd(prompt, doc)
+            request = self._build_edit_request(prompt, doc)
         else:
-            cmd = self._build_angle_cmd(prompt, doc)
+            request = self._build_angle_request(prompt, doc)
 
-        self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
         self._gen_start_time = time.monotonic()
         self._set_busy(True)
-        self._thread = GenerateThread(cmd, self._tmp_output)
+        provider = make_provider(self._current_provider(), self._fal_api_key)
+        self._thread = ProviderThread(provider, request)
         self._thread.finished.connect(self._on_finished)
         self._thread.errored.connect(self._on_error)
         self._thread.logged.connect(self._on_log_message)
         self._thread.progress.connect(self._on_progress)
         self._thread.start()
 
-    def _build_generate_cmd(self, prompt: str, doc: object) -> list[str]:
+    def _build_generate_request(self, prompt: str, doc: object) -> GenerationRequest:
         model_name = self._gen_model.currentText()
-        cli_name, model_flag, supports_strength, supports_guidance, *_ = MODEL_CLI.get(
+        _cli, _flag, supports_strength, supports_guidance, *_ = MODEL_CLI.get(
             model_name, ("mflux-generate-flux2", model_name, True, True, False)
         )
         scale = self._gen_scale.value() / 100
-        target_w = max(1, int(doc.width() * scale))
-        target_h = max(1, int(doc.height() * scale))
-        cli_path = os.path.join(MFLUX_DIR, cli_name)
+        return GenerationRequest(
+            mode="generate",
+            model_name=model_name,
+            prompt=prompt,
+            input_image_path=self._tmp_input,
+            output_path=self._tmp_output,
+            width=max(1, int(doc.width() * scale)),
+            height=max(1, int(doc.height() * scale)),
+            resize_output=abs(scale - 1.0) >= 0.001,
+            steps=self._gen_steps.value(),
+            guidance=self._gen_guidance.value() if supports_guidance else None,
+            strength=(self._gen_strength.value() / 100) if supports_strength else None,
+            quantize=self._quantize_value(self._gen_quantize),
+            seed=None if self._gen_random_seed.isChecked() else self._gen_seed.value(),
+            loras=self._get_loras(self._gen_lora_entries),
+        )
 
-        cmd = [cli_path, "--prompt", prompt]
-        if model_flag:
-            cmd += ["--model", model_flag]
-        cmd += ["--image-path", self._tmp_input]
-        cmd += ["--steps", str(self._gen_steps.value()), "--output", self._tmp_output]
-        if abs(scale - 1.0) >= 0.001:
-            cmd += ["--width", str(target_w), "--height", str(target_h)]
-        if supports_guidance:
-            cmd += ["--guidance", str(self._gen_guidance.value())]
-        if supports_strength:
-            cmd += ["--image-strength", str(self._gen_strength.value() / 100)]
-        if (q := self._quantize_value(self._gen_quantize)) is not None:
-            cmd += ["--quantize", str(q)]
-        if not self._gen_random_seed.isChecked():
-            cmd += ["--seed", str(self._gen_seed.value())]
-        cmd += self._get_lora_args(self._gen_lora_entries)
-        return cmd
-
-    def _build_edit_cmd(self, prompt: str, doc: object) -> list[str]:
+    def _build_edit_request(self, prompt: str, doc: object) -> GenerationRequest:
         model_name = self._edit_model.currentText()
         is_base = "base" in model_name
         scale = self._edit_scale.value() / 100
-        target_w = max(1, int(doc.width() * scale))
-        target_h = max(1, int(doc.height() * scale))
-
-        # flux2-edit supports --width/--height but dimensions default to the first image
-        # when set to "auto". Pre-scale the canvas so the output matches the document size.
-        if abs(scale - 1.0) >= 0.001:
-            img = QImage(self._tmp_input)
-            if not img.isNull():
-                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
-
-        cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
-        cmd = [cli_path, "--prompt", prompt, "--model", model_name]
-        cmd += ["--image-paths", self._tmp_input]
+        refs = []
         for enabled_cb, thumb, _ in self._edit_ref_entries:
             if not enabled_cb.isChecked():
                 continue
             ref_path = (thumb.imagePath() or "").strip()
             if ref_path:
-                cmd.append(ref_path)
+                refs.append(ref_path)
+        return GenerationRequest(
+            mode="edit",
+            model_name=model_name,
+            prompt=prompt,
+            input_image_path=self._tmp_input,
+            output_path=self._tmp_output,
+            width=max(1, int(doc.width() * scale)),
+            height=max(1, int(doc.height() * scale)),
+            resize_output=abs(scale - 1.0) >= 0.001,
+            steps=self._edit_steps.value(),
+            guidance=self._edit_guidance.value() if is_base else None,
+            quantize=self._quantize_value(self._edit_quantize),
+            seed=None if self._edit_random_seed.isChecked() else self._edit_seed.value(),
+            reference_image_paths=refs,
+            loras=self._get_loras(self._edit_lora_entries),
+        )
 
-        cmd += ["--steps", str(self._edit_steps.value()), "--output", self._tmp_output]
-        if is_base:
-            cmd += ["--guidance", str(self._edit_guidance.value())]
-        if (q := self._quantize_value(self._edit_quantize)) is not None:
-            cmd += ["--quantize", str(q)]
-        if not self._edit_random_seed.isChecked():
-            cmd += ["--seed", str(self._edit_seed.value())]
-        cmd += self._get_lora_args(self._edit_lora_entries)
-        return cmd
-
-    def _build_angle_cmd(self, prompt: str, doc: object) -> list[str]:
+    def _build_angle_request(self, prompt: str, doc: object) -> GenerationRequest:
         model_name = self._angle_model.currentText()
         is_base = "base" in model_name
         scale = self._angle_scale.value() / 100
-        target_w = max(1, int(doc.width() * scale))
-        target_h = max(1, int(doc.height() * scale))
-
-        # flux2-edit uses --image-paths and doesn't support --width/--height,
-        # so pre-scale the input image when needed.
-        if abs(scale - 1.0) >= 0.001:
-            img = QImage(self._tmp_input)
-            if not img.isNull():
-                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
-
-        cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
-        cmd = [
-            cli_path,
-            "--prompt", prompt,
-            "--model", model_name,
-            "--image-paths", self._tmp_input,
-            "--steps", str(self._angle_steps.value()),
-            "--guidance", str(self._angle_guidance.value()) if is_base else "1.0",
-            "--output", self._tmp_output,
-        ]
-        if (q := self._quantize_value(self._angle_quantize)) is not None:
-            cmd += ["--quantize", str(q)]
-        if not self._angle_random_seed.isChecked():
-            cmd += ["--seed", str(self._angle_seed.value())]
-        return cmd
+        # The edit model always wants a guidance scale; distilled models use 1.0.
+        guidance = self._angle_guidance.value() if is_base else 1.0
+        return GenerationRequest(
+            mode="angle",
+            model_name=model_name,
+            prompt=prompt,
+            input_image_path=self._tmp_input,
+            output_path=self._tmp_output,
+            width=max(1, int(doc.width() * scale)),
+            height=max(1, int(doc.height() * scale)),
+            resize_output=abs(scale - 1.0) >= 0.001,
+            steps=self._angle_steps.value(),
+            guidance=guidance,
+            quantize=self._quantize_value(self._angle_quantize),
+            seed=None if self._angle_random_seed.isChecked() else self._angle_seed.value(),
+        )
 
     def _build_edit_prompt(self) -> str:
         return self._edit_prompt.toPlainText().strip()
@@ -2013,8 +2067,11 @@ class KritaiDocker(DockWidget):
         else:
             scale = self._angle_scale.value() / 100
 
+        # The seedvr2 upscaler is an mflux CLI tool, so it's only available on
+        # the local backend.
         can_upscale = (
             scale < 1.0
+            and self._provider_id == PROVIDER_LOCAL
             and self._tmp_output
             and os.path.exists(self._tmp_output)
             and not (self._thread and self._thread.isRunning())
@@ -2032,7 +2089,10 @@ class KritaiDocker(DockWidget):
         upscale_group.setCheckable(True)
         upscale_group.setChecked(can_upscale)
         upscale_group.setEnabled(can_upscale)
-        upscale_group.setToolTip("If needed, the image will be upscaled to fit the canvas size.")
+        if scale < 1.0 and self._provider_id != PROVIDER_LOCAL:
+            upscale_group.setToolTip("Upscaling runs through mflux and is only available on the local backend.")
+        else:
+            upscale_group.setToolTip("If needed, the image will be upscaled to fit the canvas size.")
         upscale_form = QFormLayout(upscale_group)
 
         softness_row = QWidget()
@@ -2266,20 +2326,16 @@ class KritaiDocker(DockWidget):
         row.deleteLater()
 
     @staticmethod
-    def _get_lora_args(entries_list: list) -> list[str]:
-        """Return the --lora-paths and --lora-scales command fragments."""
-        paths = []
-        scales = []
+    def _get_loras(entries_list: list) -> list:
+        """Return the enabled LoRAs as a list of (path, scale) tuples."""
+        loras = []
         for enabled_cb, path_edit, scale_spin, _ in entries_list:
             if not enabled_cb.isChecked():
                 continue
             p = path_edit.text().strip()
             if p:
-                paths.append(p)
-                scales.append(str(scale_spin.value()))
-        if not paths:
-            return []
-        return ["--lora-paths"] + paths + ["--lora-scales"] + scales
+                loras.append((p, scale_spin.value()))
+        return loras
 
     _QUANTIZE_CHOICES = [None, 3, 4, 5, 6, 8]
 
