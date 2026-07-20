@@ -16,6 +16,8 @@ brew install krita uv hf
 uv tool install --upgrade mflux
 ```
 
+The `mflux` install is optional up front: the first time you run a local action without it, Kritai offers to install it for you (via `uv`, bootstrapping `uv` through Homebrew if needed). The **Mask** tab (background removal) uses [rembg](https://github.com/danielgatis/rembg) and installs it the same way on first use.
+
 > [!tip]
 > Some HuggingFace models are gated and require logging in with an access token. Run `hf auth login` before downloading them.
 
