@@ -812,11 +812,23 @@ class KritaiDocker(DockWidget):
     # Tab builders
     # ------------------------------------------------------------------
 
+    def _tab_description(self, text: str) -> QLabel:
+        """A muted, wrapping caption shown at the top of a tab."""
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet("color: #888; font-size: 11px;")
+        return label
+
     def _build_generate_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        layout.addWidget(self._tab_description(
+            "Generates a new image from your prompt, using the current canvas "
+            "as the starting point."
+        ))
 
         # --- Model selector ---
         self._gen_model = QComboBox()
@@ -923,8 +935,13 @@ class KritaiDocker(DockWidget):
     def _build_edit_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        layout.addWidget(self._tab_description(
+            "Edits the current canvas following your prompt. Optionally add "
+            "reference images to steer the result."
+        ))
 
         # --- Prompt ---
         self._edit_prompt = QPlainTextEdit()
@@ -1032,8 +1049,13 @@ class KritaiDocker(DockWidget):
     def _build_angle_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
+
+        layout.addWidget(self._tab_description(
+            "Re-renders the subject from a new camera angle while keeping its "
+            "style, lighting, and background."
+        ))
 
         # --- 3-D orbit widget + angle controls side by side ---
         orbit_row = QHBoxLayout()
