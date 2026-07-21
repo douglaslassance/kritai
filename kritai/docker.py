@@ -957,6 +957,23 @@ class KritaiDocker(DockWidget):
         self._tabs.addTab(self._build_edit_tab(), "Edit")
         self._tabs.addTab(self._build_angle_tab(), "Frame")
         self._tabs.addTab(self._build_mask_tab(), "Mask")
+        self._tabs.setTabToolTip(0, (
+            "Generates a new image from your prompt, using the current canvas "
+            "as the starting point."
+        ))
+        self._tabs.setTabToolTip(1, (
+            "Edits the current canvas or selection following your prompt. "
+            "Optionally add reference images to steer the result."
+        ))
+        self._tabs.setTabToolTip(2, (
+            "Re-renders the subject from a new camera angle while keeping its "
+            "style, lighting, and background."
+        ))
+        self._tabs.setTabToolTip(3, (
+            "Removes the background from the current canvas or selection and "
+            "previews the result as a transparent image, ready to import as a "
+            "new layer. Model weights download on first use."
+        ))
         self._tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self._tabs)
 
@@ -1072,35 +1089,11 @@ class KritaiDocker(DockWidget):
     # Tab builders
     # ------------------------------------------------------------------
 
-    def _tab_description(self, text: str) -> QWidget:
-        """A muted, wrapping caption shown at the top of a tab, with a rule below."""
-        container = QWidget()
-        box = QVBoxLayout(container)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(6)
-
-        label = QLabel(text)
-        label.setWordWrap(True)
-        label.setStyleSheet("color: #888; font-size: 11px;")
-        box.addWidget(label)
-
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        box.addWidget(line)
-
-        return container
-
     def _build_generate_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-
-        layout.addWidget(self._tab_description(
-            "Generates a new image from your prompt, using the current canvas "
-            "as the starting point."
-        ))
 
         # --- Model selector ---
         self._gen_model = QComboBox()
@@ -1210,11 +1203,6 @@ class KritaiDocker(DockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        layout.addWidget(self._tab_description(
-            "Edits the current canvas or selection following your prompt. "
-            "Optionally add reference images to steer the result."
-        ))
-
         # --- Prompt ---
         self._edit_prompt = QPlainTextEdit()
         self._edit_prompt.setPlaceholderText("Prompt...")
@@ -1323,11 +1311,6 @@ class KritaiDocker(DockWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-
-        layout.addWidget(self._tab_description(
-            "Re-renders the subject from a new camera angle while keeping its "
-            "style, lighting, and background."
-        ))
 
         # --- 3-D orbit widget + angle controls side by side ---
         orbit_row = QHBoxLayout()
@@ -1532,12 +1515,6 @@ class KritaiDocker(DockWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
-
-        layout.addWidget(self._tab_description(
-            "Removes the background from the current canvas or selection and "
-            "previews the result as a transparent image, ready to import as a "
-            "new layer. Model weights download on first use."
-        ))
 
         self._mask_model = QComboBox()
         model_tooltips = {
