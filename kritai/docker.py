@@ -1072,12 +1072,24 @@ class KritaiDocker(DockWidget):
     # Tab builders
     # ------------------------------------------------------------------
 
-    def _tab_description(self, text: str) -> QLabel:
-        """A muted, wrapping caption shown at the top of a tab."""
+    def _tab_description(self, text: str) -> QWidget:
+        """A muted, wrapping caption shown at the top of a tab, with a rule below."""
+        container = QWidget()
+        box = QVBoxLayout(container)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+
         label = QLabel(text)
         label.setWordWrap(True)
         label.setStyleSheet("color: #888; font-size: 11px;")
-        return label
+        box.addWidget(label)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        box.addWidget(line)
+
+        return container
 
     def _build_generate_tab(self) -> QWidget:
         content = QWidget()
