@@ -1211,9 +1211,8 @@ class KritaiDocker(DockWidget):
         layout.setSpacing(6)
 
         layout.addWidget(self._tab_description(
-            "Edits the current canvas (or just the active selection, if there is "
-            "one) following your prompt. Optionally add reference images to steer "
-            "the result."
+            "Edits the current canvas or selection following your prompt. "
+            "Optionally add reference images to steer the result."
         ))
 
         # --- Prompt ---
@@ -1535,10 +1534,9 @@ class KritaiDocker(DockWidget):
         layout.setSpacing(6)
 
         layout.addWidget(self._tab_description(
-            "Removes the background from the current canvas (or just the active "
-            "selection, if there is one) and previews the result as a transparent "
-            "image, ready to import as a new layer. Model weights download on "
-            "first use."
+            "Removes the background from the current canvas or selection and "
+            "previews the result as a transparent image, ready to import as a "
+            "new layer. Model weights download on first use."
         ))
 
         self._mask_model = QComboBox()
