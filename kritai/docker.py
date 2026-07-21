@@ -5,6 +5,8 @@ import json
 import math
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -74,6 +76,50 @@ EDIT_MODELS = ["flux2-edit"]
 
 # Models available in the Angle tab (must be compatible with mflux-generate-flux2-edit).
 ANGLE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
+
+# --- External tool discovery ------------------------------------------------
+
+# `uv tool install` and Homebrew drop binaries in a handful of well-known dirs
+# that Krita's minimal (Finder-launched) PATH often doesn't include, so we
+# search them explicitly rather than relying on PATH alone.
+_TOOL_SEARCH_DIRS = [
+    MFLUX_DIR,                              # uv tool install / pipx default
+    "/opt/homebrew/bin",                   # Homebrew on Apple Silicon
+    "/usr/local/bin",                      # Homebrew on Intel
+    os.path.expanduser("~/.cargo/bin"),
+]
+
+
+def find_executable(name: str) -> Optional[str]:
+    """Full path to *name* if it's installed, else ``None``.
+
+    Checks PATH first, then the common install dirs above, since Krita launched
+    from Finder inherits a stripped-down PATH.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    for directory in _TOOL_SEARCH_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+# --- rembg (background removal, Mask tab) -----------------------------------
+
+# Console script installed by ``uv tool install "rembg[cli]"``.
+REMBG_CLI = "rembg"
+
+# Curated subset of rembg's models, best-first: quality / balanced / fast.
+# Names must match rembg's ``-m`` values exactly. Weights download on first
+# use into ~/.u2net/. (rembg ships many more niche models — anime, portrait,
+# human-seg, etc. — deliberately not exposed here to keep the choice simple.)
+MASK_MODELS = [
+    "birefnet-general",
+    "isnet-general-use",
+    "u2net",
+]
 
 AZIMUTH_MAP = [
     (0,    "front view"),
@@ -610,6 +656,214 @@ class GenerateThread(QThread):
             self.errored.emit(str(e))
 
 
+# ======================================================================
+# Dependency detection + one-click install
+# ======================================================================
+
+
+class _Dependency:
+    """A CLI tool Kritai shells out to, plus how to install it."""
+
+    def __init__(self, label: str, package: str, executables: list[str],
+                 docs_url: str, reason: str, install_args: list[str] = None) -> None:
+        self.label = label              # human name, e.g. "mflux"
+        self.package = package          # uv package spec, e.g. "rembg[cli]"
+        self.executables = executables  # CLI names that must exist once installed
+        self.docs_url = docs_url
+        self.reason = reason            # one-line "why it's needed"
+        self.install_args = install_args or []  # extra flags for `uv tool install`
+
+
+DEP_MFLUX = _Dependency(
+    "mflux",
+    "mflux",
+    ["mflux-generate-flux2"],
+    "https://github.com/filipstrand/mflux",
+    "Local generation, editing, framing and upscaling run through the mflux CLI.",
+)
+DEP_REMBG = _Dependency(
+    "rembg",
+    # [cli] gives the command; [cpu] pulls the onnxruntime inference backend
+    # (rembg 2.x split it into cpu/gpu extras) — without it `rembg i` errors
+    # with "No onnxruntime backend found".
+    "rembg[cli,cpu]",
+    [REMBG_CLI],
+    "https://github.com/danielgatis/rembg",
+    "Background removal in the Mask tab runs through the rembg CLI.",
+    # rembg -> pymatting -> numba: without this floor uv backtracks to an
+    # ancient numba whose llvmlite has no Python 3.12 wheel and fails to build.
+    install_args=["--with", "numba>=0.60"],
+)
+
+
+class InstallThread(QThread):
+    """Runs a sequence of shell commands, streaming output; stops on first failure."""
+
+    logged = pyqtSignal(str)
+    progress = pyqtSignal(int)
+    done = pyqtSignal(bool)           # True if every command succeeded
+
+    def __init__(self, commands: list[list[str]]) -> None:
+        super().__init__()
+        self.commands = commands
+
+    def run(self) -> None:
+        clean_env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE")
+        }
+        for cmd in self.commands:
+            self.logged.emit("$ " + " ".join(cmd))
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, env=clean_env,
+                )
+            except OSError as e:
+                self.logged.emit(str(e))
+                self.done.emit(False)
+                return
+            for line in proc.stdout:
+                self.logged.emit(line.rstrip())
+                m = re.search(r"(\d+)%\|", line)
+                if m:
+                    self.progress.emit(int(m.group(1)))
+            proc.wait()
+            if proc.returncode != 0:
+                self.done.emit(False)
+                return
+        self.done.emit(True)
+
+
+class DependencyDialog(QDialog):
+    """Explains a missing CLI dependency and offers a one-click install.
+
+    Installs via ``uv tool install``, bootstrapping uv through Homebrew when uv
+    isn't present. Falls back to a copy-command when neither uv nor brew exist.
+    Sets ``self.installed`` and calls ``accept()`` once the tool is on disk.
+    """
+
+    def __init__(self, parent, dep: _Dependency, log_fn=None) -> None:
+        super().__init__(parent)
+        self._dep = dep
+        self._log_fn = log_fn or (lambda _s: None)
+        self.installed = False
+        self._thread: Optional[InstallThread] = None
+
+        self.setWindowTitle(f"{dep.label} required")
+        layout = QVBoxLayout(self)
+
+        msg = QLabel(f"<b>{dep.label}</b> isn't installed.<br>{dep.reason}")
+        msg.setWordWrap(True)
+        layout.addWidget(msg)
+
+        uv = find_executable("uv")
+        brew = find_executable("brew")
+        self._commands = self._plan_commands(dep, uv, brew)
+
+        # Shell-quote for display/copy so pasting into zsh doesn't glob on the
+        # brackets in specs like rembg[cli]. (The actual install runs argv-style
+        # via subprocess, so it's unaffected either way.)
+        def _fmt(cmd):
+            return " ".join(shlex.quote(tok) for tok in cmd)
+
+        self._cmd_text = (
+            "\n".join(_fmt(c) for c in self._commands)
+            if self._commands
+            else _fmt(["uv", "tool", "install", "--upgrade", dep.package])
+        )
+        cmd_box = QPlainTextEdit(self._cmd_text)
+        cmd_box.setReadOnly(True)
+        cmd_box.setFixedHeight(56)
+        cmd_box.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        layout.addWidget(cmd_box)
+
+        if not self._commands:
+            hint = QLabel(
+                "Neither <code>uv</code> nor Homebrew was found. Install uv "
+                "(<code>brew install uv</code>, or see astral.sh/uv), then run the "
+                "command above in a terminal."
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 100)
+        self._progress.setVisible(False)
+        layout.addWidget(self._progress)
+
+        self._log = QPlainTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setVisible(False)
+        self._log.setMinimumHeight(120)
+        self._log.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        layout.addWidget(self._log)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        copy_btn = QPushButton("Copy Command")
+        copy_btn.clicked.connect(self._copy)
+        btns.addWidget(copy_btn)
+        self._install_btn = QPushButton(f"Install {dep.label}")
+        self._install_btn.setDefault(True)
+        self._install_btn.setEnabled(bool(self._commands))
+        self._install_btn.clicked.connect(self._start_install)
+        btns.addWidget(self._install_btn)
+        self._close_btn = QPushButton("Close")
+        self._close_btn.clicked.connect(self.reject)
+        btns.addWidget(self._close_btn)
+        layout.addLayout(btns)
+
+    @staticmethod
+    def _plan_commands(dep: _Dependency, uv, brew) -> list[list[str]]:
+        def uv_install(uv_path):
+            return [uv_path, "tool", "install", "--upgrade", dep.package, *dep.install_args]
+
+        if uv:
+            return [uv_install(uv)]
+        if brew:
+            # Homebrew installs uv into its own bin dir, right next to brew.
+            uv_after = os.path.join(os.path.dirname(brew), "uv")
+            return [[brew, "install", "uv"], uv_install(uv_after)]
+        return []
+
+    def _copy(self) -> None:
+        from PyQt5.QtWidgets import QApplication
+        QApplication.clipboard().setText(self._cmd_text)
+
+    def _start_install(self) -> None:
+        self._install_btn.setEnabled(False)
+        self._close_btn.setEnabled(False)  # avoid tearing down a running thread
+        self._progress.setVisible(True)
+        self._progress.setValue(0)
+        self._log.setVisible(True)
+        self._thread = InstallThread(self._commands)
+        self._thread.logged.connect(self._on_log)
+        self._thread.progress.connect(self._progress.setValue)
+        self._thread.done.connect(self._on_done)
+        self._thread.start()
+
+    def _on_log(self, text: str) -> None:
+        self._log.appendPlainText(text)
+        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
+        self._log_fn(text)
+
+    def _on_done(self, ok: bool) -> None:
+        # Trust the filesystem, not just the exit code: uv may succeed yet land
+        # the binary somewhere we didn't expect.
+        self.installed = all(find_executable(e) for e in self._dep.executables)
+        self._close_btn.setEnabled(True)
+        if self.installed:
+            self.accept()
+        else:
+            self._progress.setVisible(False)
+            self._install_btn.setEnabled(True)
+            self._on_log(
+                "Installation did not complete — see the log above, or run the "
+                "command manually."
+            )
+
+
 class _FocusOutSignal(QObject):
     """Emits focusLost when the watched widget loses focus."""
     focusLost = pyqtSignal()
@@ -654,6 +908,11 @@ class KritaiDocker(DockWidget):
         self._doc_settings: dict[str, dict] = {}
         self._upscale_settings: dict[str, dict] = {}
         self._edit_selection_bounds: Optional[tuple] = None
+        # Where a result should land on import: (x, y, w, h) for a selection-
+        # scoped cutout, or None for a full-canvas result. Tracked per document
+        # (keyed like _doc_previews) so it survives until the user clicks Use.
+        self._result_bounds: dict[str, Optional[tuple]] = {}
+        self._active_result_bounds: Optional[tuple] = None  # for the in-flight run
 
         # Flush settings to annotation on save and on application close.
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
@@ -697,6 +956,24 @@ class KritaiDocker(DockWidget):
         self._tabs.addTab(self._build_generate_tab(), "Generate")
         self._tabs.addTab(self._build_edit_tab(), "Edit")
         self._tabs.addTab(self._build_angle_tab(), "Frame")
+        self._tabs.addTab(self._build_mask_tab(), "Mask")
+        self._tabs.setTabToolTip(0, (
+            "Generates a new image from your prompt, using the current canvas "
+            "as the starting point."
+        ))
+        self._tabs.setTabToolTip(1, (
+            "Edits the current canvas or selection following your prompt. "
+            "Optionally add reference images to steer the result."
+        ))
+        self._tabs.setTabToolTip(2, (
+            "Re-renders the subject from a new camera angle while keeping its "
+            "style, lighting, and background."
+        ))
+        self._tabs.setTabToolTip(3, (
+            "Removes the background from the current canvas or selection and "
+            "previews the result as a transparent image, ready to import as a "
+            "new layer. Model weights download on first use."
+        ))
         self._tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self._tabs)
 
@@ -815,7 +1092,7 @@ class KritaiDocker(DockWidget):
     def _build_generate_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
         # --- Model selector ---
@@ -923,7 +1200,7 @@ class KritaiDocker(DockWidget):
     def _build_edit_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
         # --- Prompt ---
@@ -938,17 +1215,6 @@ class KritaiDocker(DockWidget):
         form.setSpacing(4)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setHorizontalSpacing(20)
-
-        self._edit_image_source = QComboBox()
-        self._edit_image_source.addItem("Canvas")
-        self._edit_image_source.addItem("References")
-        self._edit_image_source.setToolTip(
-            "Canvas: edit the current canvas using reference images as conditioning.\n"
-            "References: generate from scratch using reference images for style guidance."
-        )
-        self._edit_image_source.currentIndexChanged.connect(self._update_edit_tab_ui)
-        self._edit_image_source.currentIndexChanged.connect(self._save_settings)
-        form.addRow("Image Source", self._edit_image_source)
 
         self._edit_model = QComboBox()
         edit_model_tooltips = {
@@ -1043,7 +1309,7 @@ class KritaiDocker(DockWidget):
     def _build_angle_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
         # --- 3-D orbit widget + angle controls side by side ---
@@ -1244,6 +1510,43 @@ class KritaiDocker(DockWidget):
     # Tab-specific UI updates
     # ------------------------------------------------------------------
 
+    def _build_mask_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        self._mask_model = QComboBox()
+        model_tooltips = {
+            "birefnet-general":  "Highest edge quality. Larger download, slower first run.",
+            "isnet-general-use": "Balanced quality and speed. Good default.",
+            "u2net":             "Fastest. Solid for clear, simple subjects.",
+        }
+        for m in MASK_MODELS:
+            self._mask_model.addItem(m)
+            idx = self._mask_model.count() - 1
+            self._mask_model.setItemData(idx, model_tooltips.get(m, ""), Qt.ToolTipRole)
+        self._mask_model.setCurrentIndex(0)
+
+        self._mask_alpha_matting = QCheckBox("Refine Edges (Alpha Matting)")
+        self._mask_alpha_matting.setToolTip(
+            "Post-process the cutout for cleaner, softer edges (hair, fur). Slower."
+        )
+
+        settings_widget = QWidget()
+        form = QFormLayout(settings_widget)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setSpacing(4)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.setHorizontalSpacing(20)
+        form.addRow("Model", self._mask_model)
+        form.addRow("", self._mask_alpha_matting)
+        layout.addWidget(settings_widget)
+
+        layout.addStretch()
+        content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        return content
+
     def _on_tab_changed(self, index: int) -> None:
         self._save_settings()
         self._update_generate_btn()
@@ -1265,7 +1568,6 @@ class KritaiDocker(DockWidget):
 
     def _update_edit_tab_ui(self) -> None:
         is_base = "base" in self._edit_model.currentText()
-        is_canvas = self._edit_image_source.currentText() == "Canvas"
         self._edit_guidance.setVisible(is_base)
         if self._edit_guidance_label:
             self._edit_guidance_label.setVisible(is_base)
@@ -1273,14 +1575,8 @@ class KritaiDocker(DockWidget):
         if self._edit_strength_label:
             self._edit_strength_label.setVisible(False)
         self._edit_ref_section.setVisible(True)
-        self._edit_scale.setEnabled(is_canvas)
-        self._edit_scale_spin.setEnabled(is_canvas)
-        if is_canvas:
-            self._edit_prompt.setPlaceholderText("Describe what you want to change...")
-            self._edit_prompt.setToolTip("Describe what you want to change in the canvas.")
-        else:
-            self._edit_prompt.setPlaceholderText("Describe what you want to generate...")
-            self._edit_prompt.setToolTip("Describe the image to generate, drawing style from the reference images.")
+        self._edit_prompt.setPlaceholderText("Describe what you want to change...")
+        self._edit_prompt.setToolTip("Describe what you want to change in the canvas.")
 
     def _update_angle_tab_ui(self) -> None:
         is_base = "base" in self._angle_model.currentText()
@@ -1355,6 +1651,13 @@ class KritaiDocker(DockWidget):
         ]:
             signal.connect(self._save_settings)
 
+        # Mask tab signals.
+        for signal in [
+            self._mask_model.currentIndexChanged,
+            self._mask_alpha_matting.toggled,
+        ]:
+            signal.connect(self._save_settings)
+
         # Auto-refresh triggers — text fields on focus-out, others immediately.
         gen_prompt_filter = _FocusOutSignal(self._gen_prompt)
         gen_prompt_filter.focusLost.connect(self._on_setting_changed)
@@ -1388,6 +1691,8 @@ class KritaiDocker(DockWidget):
             self._angle_scale.valueChanged,
             self._angle_seed.valueChanged,
             self._angle_random_seed.toggled,
+            self._mask_model.currentIndexChanged,
+            self._mask_alpha_matting.toggled,
         ]:
             signal.connect(self._on_setting_changed)
 
@@ -1422,7 +1727,6 @@ class KritaiDocker(DockWidget):
                 ],
             },
             "edit": {
-                "image_source": self._edit_image_source.currentText(),
                 "model": self._edit_model.currentText(),
                 "prompt": self._edit_prompt.toPlainText(),
                 "quantize": self._quantize_value(self._edit_quantize),
@@ -1453,6 +1757,10 @@ class KritaiDocker(DockWidget):
                 "scale": self._angle_scale.value() / 100,
                 "seed": self._angle_seed.value(),
                 "random_seed": self._angle_random_seed.isChecked(),
+            },
+            "mask": {
+                "model": self._mask_model.currentText(),
+                "alpha_matting": self._mask_alpha_matting.isChecked(),
             },
             "upscale": self._upscale_settings.get(uid, {}),
             "preview_path": self._tmp_output or "",
@@ -1532,6 +1840,7 @@ class KritaiDocker(DockWidget):
             self._angle_distance, self._angle_distance_spin,
             self._orbit, self._angle_quantize, self._angle_steps, self._angle_guidance,
             self._angle_scale, self._angle_seed, self._angle_random_seed,
+            self._mask_model, self._mask_alpha_matting,
             self._tabs,
         ]
         for w in all_widgets:
@@ -1566,9 +1875,6 @@ class KritaiDocker(DockWidget):
 
         # --- Restore Edit tab ---
         edit = data.get("edit", {})
-        src_idx = self._edit_image_source.findText(edit.get("image_source", "Canvas"))
-        if src_idx >= 0:
-            self._edit_image_source.setCurrentIndex(src_idx)
         idx = self._edit_model.findText(edit.get("model", "flux2-klein-base-4b"))
         if idx >= 0:
             self._edit_model.setCurrentIndex(idx)
@@ -1628,6 +1934,13 @@ class KritaiDocker(DockWidget):
         self._angle_seed.setValue(angle.get("seed", 0))
         self._angle_random_seed.setChecked(angle.get("random_seed", False))
         self._angle_seed.setDisabled(self._angle_random_seed.isChecked())
+
+        # --- Restore Mask tab ---
+        mask = data.get("mask", {})
+        midx = self._mask_model.findText(mask.get("model", MASK_MODELS[0]))
+        if midx >= 0:
+            self._mask_model.setCurrentIndex(midx)
+        self._mask_alpha_matting.setChecked(mask.get("alpha_matting", False))
 
         # --- Restore active tab ---
         self._tabs.setCurrentIndex(data.get("active_tab", 0))
@@ -1725,6 +2038,10 @@ class KritaiDocker(DockWidget):
             self._generate_btn.setToolTip("No active document.")
             return
         tab = self._tabs.currentIndex()
+        if tab == 3:
+            self._generate_btn.setEnabled(True)
+            self._generate_btn.setToolTip("Remove the background from the current canvas.")
+            return
         if tab == 0:
             has_prompt = bool(self._gen_prompt.toPlainText().strip())
         elif tab == 1:
@@ -1735,15 +2052,6 @@ class KritaiDocker(DockWidget):
             self._generate_btn.setEnabled(False)
             self._generate_btn.setToolTip("Enter a prompt to generate.")
             return
-        if tab == 1 and self._edit_image_source.currentText() == "References":
-            has_ref = any(
-                enabled_cb.isChecked() and (thumb.imagePath() or "").strip()
-                for enabled_cb, thumb, _ in self._edit_ref_entries
-            )
-            if not has_ref:
-                self._generate_btn.setEnabled(False)
-                self._generate_btn.setToolTip("Add at least one reference image.")
-                return
         self._generate_btn.setEnabled(True)
         self._generate_btn.setToolTip("Generate an image from the current canvas and prompt.")
 
@@ -1775,6 +2083,14 @@ class KritaiDocker(DockWidget):
             self._thread.wait()
         self._set_busy(False)
 
+    def _ensure_dependency(self, dep: _Dependency) -> bool:
+        """Return True if *dep* is available, prompting to install it if not."""
+        if all(find_executable(e) for e in dep.executables):
+            return True
+        dlg = DependencyDialog(self, dep, log_fn=self._on_log_message)
+        dlg.exec_()
+        return dlg.installed
+
     def _generate(self) -> None:
         from krita import Krita
 
@@ -1784,14 +2100,21 @@ class KritaiDocker(DockWidget):
             return
 
         tab = self._tabs.currentIndex()
-        if tab == 0:
+        is_mask = tab == 3
+        if is_mask:
+            prompt = ""
+        elif tab == 0:
             prompt = self._gen_prompt.toPlainText().strip()
         elif tab == 1:
             prompt = self._build_edit_prompt()
         else:
             prompt = self._build_angle_prompt()
 
-        if not prompt:
+        if not is_mask and not prompt:
+            return
+
+        # Make sure the CLI this action needs is installed before doing any work.
+        if not self._ensure_dependency(DEP_REMBG if is_mask else DEP_MFLUX):
             return
 
         if self._thread and self._thread.isRunning():
@@ -1816,16 +2139,39 @@ class KritaiDocker(DockWidget):
         )
 
         self._edit_selection_bounds = None
+        self._active_result_bounds = None
+        if is_mask:
+            # Honor an active selection: process only that region and remember
+            # where to drop the cutout back on import. No selection → whole canvas.
+            sel = doc.selection()
+            bounds = None
+            if sel and sel.width() > 0 and sel.height() > 0:
+                bounds = _export_selection_crop(doc, self._tmp_input)
+            if bounds:
+                self._active_result_bounds = bounds
+                _sx, _sy, _sw, _sh = bounds
+                if _sw > 0:
+                    self._preview.setRatio(_sh / _sw)
+            else:
+                self._export_canvas(doc, self._tmp_input)
+                self._update_preview_ratio(doc)
+            self._start_mask()
+            return
+
         if tab == 1:
             sel = doc.selection()
             if sel and sel.width() > 0 and sel.height() > 0:
                 bounds = _export_selection_crop(doc, self._tmp_input)
                 if bounds:
                     self._edit_selection_bounds = bounds
+                    _sx, _sy, _sw, _sh = bounds
+                    if _sw > 0:
+                        self._preview.setRatio(_sh / _sw)
                 else:
                     self._export_canvas(doc, self._tmp_input)
             else:
                 self._export_canvas(doc, self._tmp_input)
+                self._update_preview_ratio(doc)
         else:
             self._export_canvas(doc, self._tmp_input)
 
@@ -1837,6 +2183,27 @@ class KritaiDocker(DockWidget):
             cmd = self._build_angle_cmd(prompt, doc)
 
         self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
+        self._gen_start_time = time.monotonic()
+        self._set_busy(True)
+        self._thread = GenerateThread(cmd, self._tmp_output)
+        self._thread.finished.connect(self._on_finished)
+        self._thread.errored.connect(self._on_error)
+        self._thread.logged.connect(self._on_log_message)
+        self._thread.progress.connect(self._on_progress)
+        self._thread.start()
+
+    def _start_mask(self) -> None:
+        """Run rembg on the exported canvas, landing a transparent PNG."""
+        rembg = find_executable(REMBG_CLI)  # guaranteed by _ensure_dependency
+        model = self._mask_model.currentText()
+        cmd = [rembg, "i", "-m", model]
+        if self._mask_alpha_matting.isChecked():
+            cmd.append("-a")
+        cmd += [self._tmp_input, self._tmp_output]
+
+        self._on_log_message(
+            "Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd)
+        )
         self._gen_start_time = time.monotonic()
         self._set_busy(True)
         self._thread = GenerateThread(cmd, self._tmp_output)
@@ -1881,21 +2248,16 @@ class KritaiDocker(DockWidget):
         target_w = max(1, int(doc.width() * scale))
         target_h = max(1, int(doc.height() * scale))
 
-        is_canvas = self._edit_image_source.currentText() == "Canvas"
-
         # flux2-edit supports --width/--height but dimensions default to the first image
         # when set to "auto". Pre-scale the canvas so the output matches the document size.
-        if is_canvas and abs(scale - 1.0) >= 0.001:
+        if abs(scale - 1.0) >= 0.001:
             img = QImage(self._tmp_input)
             if not img.isNull():
                 img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
 
         cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
         cmd = [cli_path, "--prompt", prompt, "--model", model_name]
-        if is_canvas:
-            cmd += ["--image-paths", self._tmp_input]
-        else:
-            cmd += ["--image-paths"]
+        cmd += ["--image-paths", self._tmp_input]
         for enabled_cb, thumb, _ in self._edit_ref_entries:
             if not enabled_cb.isChecked():
                 continue
@@ -1955,29 +2317,19 @@ class KritaiDocker(DockWidget):
             f"File exists: {exists}, size: {size} bytes"
         )
         self._show_preview(output_path)
+        # Remember where this result should land on import (a selection-scoped
+        # cutout goes back at its bounds; everything else is full-canvas).
+        if self._current_doc:
+            uid = self._current_doc.fileName() or str(id(self._current_doc))
+            self._result_bounds[uid] = self._active_result_bounds
         elapsed = time.monotonic() - self._gen_start_time
         minutes, seconds = divmod(int(elapsed), 60)
         self._time_label.setText(f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s")
         self._time_label.setVisible(True)
         self._progress.setVisible(False)
 
-        if self._edit_selection_bounds and self._current_doc:
-            sx, sy, sw, sh = self._edit_selection_bounds
+        if self._edit_selection_bounds:
             self._edit_selection_bounds = None
-            result_img = QImage(output_path)
-            if not result_img.isNull():
-                result_img = result_img.convertToFormat(QImage.Format_ARGB32)
-                if result_img.width() != sw or result_img.height() != sh:
-                    result_img = result_img.scaled(
-                        sw, sh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation
-                    )
-                doc = self._current_doc
-                layer = doc.createNode("Kritai Edit", "paintlayer")
-                doc.rootNode().addChildNode(layer, None)
-                ptr = result_img.bits()
-                ptr.setsize(result_img.byteCount())
-                layer.setPixelData(bytes(ptr), sx, sy, sw, sh)
-                doc.refreshProjection()
 
     def _on_error(self, message: str) -> None:
         self._set_busy(False)
@@ -2040,6 +2392,7 @@ class KritaiDocker(DockWidget):
         if self._current_doc:
             uid = self._current_doc.fileName() or str(id(self._current_doc))
             self._doc_previews.pop(uid, None)
+            self._result_bounds.pop(uid, None)
 
     def _import_to_layer(self) -> None:
         doc = self._current_doc
@@ -2057,8 +2410,10 @@ class KritaiDocker(DockWidget):
             scale = self._gen_scale.value() / 100
         elif tab == 1:
             scale = self._edit_scale.value() / 100
-        else:
+        elif tab == 2:
             scale = self._angle_scale.value() / 100
+        else:
+            scale = 1.0  # Mask output matches the canvas; nothing to upscale.
 
         can_upscale = (
             scale < 1.0
@@ -2156,6 +2511,10 @@ class KritaiDocker(DockWidget):
                 dlg.accept()
                 return
 
+            # Upscaling shells out to mflux — make sure it's installed first.
+            if not self._ensure_dependency(DEP_MFLUX):
+                return
+
             # Disable controls and show progress.
             upscale_group.setEnabled(False)
             buttons.button(QDialogButtonBox.Ok).setEnabled(False)
@@ -2235,14 +2594,29 @@ class KritaiDocker(DockWidget):
         img = pixmap.toImage().convertToFormat(QImage.Format_ARGB32)
         if img.isNull():
             return
-        if img.width() != doc.width() or img.height() != doc.height():
-            img = img.scaled(doc.width(), doc.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+        uid = doc.fileName() or str(id(doc))
+        bounds = self._result_bounds.get(uid)
 
         layer = doc.createNode("Kritai Result", "paintlayer")
         doc.rootNode().addChildNode(layer, None)
-        ptr = img.bits()
-        ptr.setsize(img.byteCount())
-        layer.setPixelData(bytes(ptr), 0, 0, img.width(), img.height())
+
+        if bounds:
+            # Selection-scoped cutout: drop it back at its original position,
+            # native size, on an otherwise-transparent full-canvas layer.
+            x, y, w, h = bounds
+            if img.width() != w or img.height() != h:
+                img = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            ptr = img.bits()
+            ptr.setsize(img.byteCount())
+            layer.setPixelData(bytes(ptr), x, y, w, h)
+        else:
+            if img.width() != doc.width() or img.height() != doc.height():
+                img = img.scaled(doc.width(), doc.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            ptr = img.bits()
+            ptr.setsize(img.byteCount())
+            layer.setPixelData(bytes(ptr), 0, 0, img.width(), img.height())
+
         doc.refreshProjection()
 
         # Stop auto mode now that the result is committed to the document.
