@@ -1211,8 +1211,9 @@ class KritaiDocker(DockWidget):
         layout.setSpacing(6)
 
         layout.addWidget(self._tab_description(
-            "Edits the current canvas following your prompt. Optionally add "
-            "reference images to steer the result."
+            "Edits the current canvas (or just the active selection, if there is "
+            "one) following your prompt. Optionally add reference images to steer "
+            "the result."
         ))
 
         # --- Prompt ---
