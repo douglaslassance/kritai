@@ -781,10 +781,12 @@ class DependencyDialog(QDialog):
         if not self._commands:
             hint = QLabel(
                 "Neither <code>uv</code> nor Homebrew was found. Install uv "
-                "(<code>brew install uv</code>, or see astral.sh/uv), then run the "
-                "command above in a terminal."
+                "(<code>brew install uv</code>, or see "
+                '<a href="https://github.com/astral-sh/uv">github.com/astral-sh/uv</a>), then '
+                "run the command above in a terminal."
             )
             hint.setWordWrap(True)
+            hint.setOpenExternalLinks(True)
             layout.addWidget(hint)
 
         self._progress = QProgressBar()
