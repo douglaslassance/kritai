@@ -24,3 +24,6 @@ kritai/Manual.html
 ._*
 .Spotlight-V100
 .Trashes
+
+# Claude Code local state
+.claude/
