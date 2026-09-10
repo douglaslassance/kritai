@@ -63,6 +63,7 @@ MODEL_CLI = {
     # FLUX.2 — distilled variants: no guidance; base variants: guidance ok
     "flux2-klein-4b":      ("mflux-generate-flux2",      "flux2-klein-4b",      True,  False, False),
     "flux2-klein-9b":      ("mflux-generate-flux2",      "flux2-klein-9b",      True,  False, False),
+    "flux2-klein-9b-kv":   ("mflux-generate-flux2",      "flux2-klein-9b-kv",   True,  False, False),
     "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True,  False),
     "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
     # FLUX.2 edit — canvas + optional reference image via --image-paths.
@@ -74,8 +75,16 @@ MODEL_CLI = {
 GENERATE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
 EDIT_MODELS = ["flux2-edit"]
 
-# Models available in the Angle tab (must be compatible with mflux-generate-flux2-edit).
-ANGLE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
+# Models available in the Edit and Angle tabs (must be compatible with mflux-generate-flux2-edit).
+# flux2-klein-9b-kv is the KV-cached 9B checkpoint, which only pays off on the edit CLI,
+# so it is offered here and not in the Generate tab. Requires mflux 0.18.0 or newer.
+ANGLE_MODELS = [
+    "flux2-klein-4b",
+    "flux2-klein-9b",
+    "flux2-klein-9b-kv",
+    "flux2-klein-base-4b",
+    "flux2-klein-base-9b",
+]
 
 # --- External tool discovery ------------------------------------------------
 
@@ -600,11 +609,73 @@ class CollapsibleSection(QWidget):
         self._toggle.setText(("▼" if checked else "▶") + f"  {self._title}")
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+# tqdm draws bars like these on stderr — mflux for the denoising steps,
+# huggingface_hub while weights download:
+#   Downloading (incomplete total...):  36%|███▌ | 3.60G/10.0G [00:04<00:07, 5.91GB/s]
+#   Fetching 17 files:  12%|█▏        | 2/17 [00:03<00:24,  3.30it/s]
+#    50%|█████     | 2/4 [00:00<00:00,  3.29it/s]
+_TQDM_RE = re.compile(
+    r"^(?P<desc>.*?):?\s*(?P<pct>\d{1,3})%\|[^|]*\|\s*"
+    r"(?P<n>[^/\s]+)/(?P<total>[^\s\]]+)"
+    r"(?:\s*\[(?P<elapsed>[^<\]]*)<(?P<remaining>[^,\]]*),\s*(?P<rate>[^\]]*)\])?"
+)
+# tqdm names the rate after whatever it counts, so a "…B/s" rate means bytes,
+# which is what separates a download from progress through the generation.
+_BYTE_RATE_RE = re.compile(r"[KMGTP]?B/s$")
+
+
+class _ProgressParser:
+    """Turns tqdm bars on stderr into (percent, status, detail) updates.
+
+    A weight download draws two bars at once: one counting bytes across all
+    files and one counting the files themselves. The byte bar is the smoother
+    headline, so it drives the percentage and the file count becomes detail.
+    """
+
+    def __init__(self) -> None:
+        self._files = ""           # e.g. "2 of 17 files"
+        self._downloading = False
+
+    def feed(self, m: re.Match) -> Optional[tuple[int, str, str]]:
+        """Turn a matched tqdm bar into an update, or None if it says nothing new."""
+        pct = min(100, int(m.group("pct")))
+        desc = (m.group("desc") or "").strip().rstrip(":").strip()
+        n, total = m.group("n"), m.group("total")
+        rate = (m.group("rate") or "").strip()
+        remaining = (m.group("remaining") or "").strip()
+        eta = f" · {remaining} left" if remaining and "?" not in remaining else ""
+
+        if _BYTE_RATE_RE.search(rate):
+            self._downloading = True
+            detail = f"{n}/{total}"
+            if rate and "?" not in rate:
+                detail += f" · {rate}"
+            detail += eta
+            if self._files:
+                detail += f" · {self._files}"
+            return pct, f"Downloading… {pct}%", detail
+
+        if desc.startswith("Fetching"):
+            self._files = f"{n} of {total} files"
+            if self._downloading:
+                return None  # the byte bar is already reporting this download
+            return pct, f"Downloading… {pct}%", self._files + eta
+
+        # Anything else is progress through the generation itself.
+        self._files = ""
+        self._downloading = False
+        if desc:
+            return pct, f"{desc}… {pct}%", f"{n} of {total}{eta}"
+        return pct, f"Generating… {pct}%", f"step {n} of {total}{eta}"
+
+
 class GenerateThread(QThread):
-    finished = pyqtSignal(str)        # output path
-    errored = pyqtSignal(str)         # error message
-    logged = pyqtSignal(str)          # line of stdout/stderr for the log panel
-    progress = pyqtSignal(int)        # 0–100
+    finished = pyqtSignal(str)          # output path
+    errored = pyqtSignal(str)           # error message
+    logged = pyqtSignal(str)            # line of stdout/stderr for the log panel
+    progress = pyqtSignal(int, str, str)  # 0–100, status line, detail line
 
     def __init__(self, cmd: list[str], output_path: str) -> None:
         super().__init__()
@@ -619,6 +690,12 @@ class GenerateThread(QThread):
                 k: v for k, v in os.environ.items()
                 if k not in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE")
             }
+            # huggingface_hub turns its download bars off when stderr isn't a
+            # TTY, which is always the case here — TQDM_POSITION=-1 is its
+            # documented way back in. The interval throttles the refreshes so
+            # a long download doesn't flood the pipe.
+            clean_env["TQDM_POSITION"] = "-1"
+            clean_env["TQDM_MININTERVAL"] = "0.5"
             proc = subprocess.Popen(
                 self.cmd,
                 stdout=subprocess.PIPE,
@@ -628,14 +705,24 @@ class GenerateThread(QThread):
             )
 
             stderr_lines = []
+            parser = _ProgressParser()
 
             def drain_stderr():
-                for line in proc.stderr:
+                for raw in proc.stderr:
+                    line = _ANSI_RE.sub("", raw).strip()
+                    if not line:
+                        continue
+                    m = _TQDM_RE.match(line)
+                    if m is not None:
+                        update = parser.feed(m)
+                        if update is not None:
+                            self.progress.emit(*update)
+                        # A bar refreshes twice a second; log where it starts
+                        # and ends, not every frame in between.
+                        if int(m.group("pct")) not in (0, 100):
+                            continue
                     stderr_lines.append(line)
-                    self.logged.emit(line.rstrip())
-                    m = re.search(r"(\d+)%\|", line)
-                    if m:
-                        self.progress.emit(int(m.group(1)))
+                    self.logged.emit(line)
 
             t = threading.Thread(target=drain_stderr, daemon=True)
             t.start()
@@ -647,9 +734,9 @@ class GenerateThread(QThread):
                 self.logged.emit(stdout.strip())
 
             if proc.returncode != 0:
-                self.errored.emit("".join(stderr_lines).strip() or "mflux-generate failed")
+                self.errored.emit("\n".join(stderr_lines).strip() or "mflux-generate failed")
             else:
-                self.progress.emit(100)
+                self.progress.emit(100, "Finishing…", "")
                 self.finished.emit(self.output_path)
         except Exception as e:
             self.logged.emit(str(e))
@@ -676,9 +763,10 @@ class _Dependency:
 
 DEP_MFLUX = _Dependency(
     "mflux",
-    "mflux",
+    # 0.18.0 added the flux2-klein-9b-kv checkpoint the Edit and Angle tabs offer.
+    "mflux>=0.18.0",
     ["mflux-generate-flux2"],
-    "https://github.com/filipstrand/mflux",
+    "https://github.com/mflux-community/mflux",
     "Local generation, editing, framing and upscaling run through the mflux CLI.",
 )
 DEP_REMBG = _Dependency(
@@ -896,25 +984,55 @@ def _snap_to_nearest_wrap(value: int, mapping: list[tuple[int, str]], wrap: int 
     return min(mapping, key=dist)[1]
 
 
+class _DocJob:
+    """Generation state for a single document.
+
+    Krita shares one docker across every open document, so everything tied to
+    a run (its thread, temp files, progress, log, timing) is kept here per
+    document rather than on the docker. Switching document tabs then swaps the
+    shared widgets over instead of clobbering whatever else is generating.
+    """
+
+    def __init__(self, uid: str) -> None:
+        self.uid = uid
+        self.thread: Optional[GenerateThread] = None
+        self.tmp_input: Optional[str] = None
+        self.tmp_output: Optional[str] = None
+        self.start_time: float = 0.0
+        self.progress: int = 0
+        self.status: str = ""
+        self.detail: str = ""
+        self.elapsed: str = ""
+        self.log: str = ""
+        # Where the in-flight result should land on import: (x, y, w, h) for a
+        # selection-scoped cutout, or None for a full-canvas result.
+        self.active_bounds: Optional[tuple] = None
+        # Preview aspect ratio (height / width) for this document's result.
+        self.ratio: Optional[float] = None
+
+    @property
+    def running(self) -> bool:
+        return bool(self.thread and self.thread.isRunning())
+
+
 class KritaiDocker(DockWidget):
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Kritai")
-        self._thread: Optional[GenerateThread] = None
-        self._tmp_input: Optional[str] = None
-        self._tmp_output: Optional[str] = None
         self._last_canvas_hash: Optional[str] = None
         self._current_doc = None  # krita.Document
         self._doc_previews: dict[str, QPixmap] = {}
         self._doc_settings: dict[str, dict] = {}
         self._upscale_settings: dict[str, dict] = {}
-        self._edit_selection_bounds: Optional[tuple] = None
+        # Generation state per document, so runs in several documents can be
+        # in flight at once and each keeps its own progress, log and result.
+        self._jobs: dict[str, _DocJob] = {}
+        self._job_counter = 0
         # Where a result should land on import: (x, y, w, h) for a selection-
         # scoped cutout, or None for a full-canvas result. Tracked per document
         # (keyed like _doc_previews) so it survives until the user clicks Use.
         self._result_bounds: dict[str, Optional[tuple]] = {}
-        self._active_result_bounds: Optional[tuple] = None  # for the in-flight run
 
         # Flush settings to annotation on save and on application close.
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
@@ -933,6 +1051,35 @@ class KritaiDocker(DockWidget):
 
         self._build_ui()
         self._connect_settings_signals()
+
+    # ------------------------------------------------------------------
+    # Per-document state
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _doc_uid(doc: object) -> str:
+        """Key a document by file name, falling back to identity if unsaved."""
+        return doc.fileName() or str(id(doc))
+
+    def _current_uid(self) -> Optional[str]:
+        return self._doc_uid(self._current_doc) if self._current_doc else None
+
+    def _job_for(self, uid: str) -> _DocJob:
+        job = self._jobs.get(uid)
+        if job is None:
+            job = _DocJob(uid)
+            self._jobs[uid] = job
+        return job
+
+    def _migrate_uid(self, old_uid: str, new_uid: str) -> None:
+        """Move per-document state after a first save changes the document key."""
+        for store in (self._doc_settings, self._doc_previews,
+                      self._upscale_settings, self._result_bounds, self._jobs):
+            if old_uid in store:
+                store[new_uid] = store.pop(old_uid)
+        job = self._jobs.get(new_uid)
+        if job is not None:
+            job.uid = new_uid
 
     # ------------------------------------------------------------------
     # UI
@@ -1043,6 +1190,13 @@ class KritaiDocker(DockWidget):
         self._cancel_btn.clicked.connect(self._cancel)
         progress_row.addWidget(self._cancel_btn)
         outer.addLayout(progress_row)
+
+        # Byte counts, speed and ETA for whatever the progress bar is tracking.
+        self._progress_detail = QLabel()
+        self._progress_detail.setWordWrap(True)
+        self._progress_detail.setStyleSheet("color: #888; font-size: 11px;")
+        self._progress_detail.setVisible(False)
+        outer.addWidget(self._progress_detail)
 
         # --- Log section ---
         self._log = QPlainTextEdit()
@@ -1222,6 +1376,8 @@ class KritaiDocker(DockWidget):
         edit_model_tooltips = {
             "flux2-klein-4b":      "Distilled 4B model. Fast, no guidance.",
             "flux2-klein-9b":      "Distilled 9B model. Higher quality, no guidance.",
+            "flux2-klein-9b-kv":   "Distilled 9B model with a KV cache. Same quality as 9B and\n"
+                                   "roughly 2.4x faster once reference images are attached. No guidance.",
             "flux2-klein-base-4b": "Base 4B model. Slower, supports guidance.",
             "flux2-klein-base-9b": "Base 9B model. Best quality, supports guidance.",
         }
@@ -1229,7 +1385,7 @@ class KritaiDocker(DockWidget):
             self._edit_model.addItem(m)
             idx = self._edit_model.count() - 1
             self._edit_model.setItemData(idx, edit_model_tooltips.get(m, ""), Qt.ToolTipRole)
-        self._edit_model.setCurrentIndex(2)  # default to base-4b for edit quality
+        self._edit_model.setCurrentIndex(self._edit_model.findText("flux2-klein-base-4b"))
         self._edit_model.currentIndexChanged.connect(self._update_edit_tab_ui)
         form.addRow("Model", self._edit_model)
 
@@ -1418,6 +1574,8 @@ class KritaiDocker(DockWidget):
         angle_model_tooltips = {
             "flux2-klein-4b":      "Distilled 4B model. Fast, no guidance.",
             "flux2-klein-9b":      "Distilled 9B model. Higher quality, no guidance.",
+            "flux2-klein-9b-kv":   "Distilled 9B model with a KV cache. Same quality as 9B and\n"
+                                   "roughly 2.4x faster once reference images are attached. No guidance.",
             "flux2-klein-base-4b": "Base 4B model. Slower, supports guidance.",
             "flux2-klein-base-9b": "Base 9B model. Best quality, supports guidance.",
         }
@@ -1710,7 +1868,8 @@ class KritaiDocker(DockWidget):
         doc = self._current_doc
         if not doc:
             return
-        uid = doc.fileName() or str(id(doc))
+        uid = self._doc_uid(doc)
+        job = self._jobs.get(uid)
         new = {
             "active_tab": self._tabs.currentIndex(),
             "generate": {
@@ -1765,7 +1924,7 @@ class KritaiDocker(DockWidget):
                 "alpha_matting": self._mask_alpha_matting.isChecked(),
             },
             "upscale": self._upscale_settings.get(uid, {}),
-            "preview_path": self._tmp_output or "",
+            "preview_path": (job.tmp_output if job else None) or "",
         }
         prev = self._doc_settings.get(uid)
         self._doc_settings[uid] = new
@@ -1786,8 +1945,8 @@ class KritaiDocker(DockWidget):
         uid = filename
         # Migrate settings stored under the old id-based key (before first save).
         old_uid = str(id(doc))
-        if old_uid != uid and old_uid in self._doc_settings:
-            self._doc_settings[uid] = self._doc_settings.pop(old_uid)
+        if old_uid != uid:
+            self._migrate_uid(old_uid, uid)
         data = self._doc_settings.get(uid)
         if data:
             raw = json.dumps(data).encode("utf-8")
@@ -1810,7 +1969,7 @@ class KritaiDocker(DockWidget):
                 self._flush_settings_to_doc(doc)
 
     def _load_settings(self, doc: object) -> None:
-        uid = doc.fileName() or str(id(doc))
+        uid = self._doc_uid(doc)
         if uid in self._doc_settings:
             data = self._doc_settings[uid]
         else:
@@ -1955,7 +2114,7 @@ class KritaiDocker(DockWidget):
         # --- Restore preview image if the temp file still exists ---
         preview_path = data.get("preview_path", "")
         if preview_path and os.path.exists(preview_path):
-            self._tmp_output = preview_path
+            self._job_for(uid).tmp_output = preview_path
             pixmap = QPixmap(preview_path)
             if not pixmap.isNull():
                 self._preview.setPixmap(pixmap)
@@ -2058,7 +2217,9 @@ class KritaiDocker(DockWidget):
         self._generate_btn.setToolTip("Generate an image from the current canvas and prompt.")
 
     def _poll_canvas(self) -> None:
-        if self._thread and self._thread.isRunning():
+        uid = self._current_uid()
+        job = self._jobs.get(uid) if uid else None
+        if job and job.running:
             return
         current = self._canvas_hash()
         if current and current != self._last_canvas_hash:
@@ -2069,27 +2230,46 @@ class KritaiDocker(DockWidget):
     # Generation
     # ------------------------------------------------------------------
 
-    def _set_status(self, text: str) -> None:
-        self._progress.setFormat(text)
+    def _sync_job_ui(self) -> None:
+        """Point the shared progress widgets at the active document's job."""
+        uid = self._current_uid()
+        job = self._jobs.get(uid) if uid else None
+        running = bool(job and job.running)
+        showing = running or bool(job and job.status)
+        self._progress.setValue(job.progress if job else 0)
+        self._progress.setFormat(job.status if job else "")
+        self._progress.setVisible(showing)
+        self._progress_detail.setText(job.detail if job else "")
+        self._progress_detail.setVisible(showing and bool(job and job.detail))
+        self._cancel_btn.setEnabled(running)
+        self._cancel_btn.setVisible(running)
+        self._time_label.setText(job.elapsed if job else "")
+        self._time_label.setVisible(bool(job and job.elapsed and not running))
 
-    def _set_busy(self, busy: bool) -> None:
-        self._progress.setValue(0)
-        self._progress.setVisible(busy)
-        self._cancel_btn.setEnabled(busy)
-        self._cancel_btn.setVisible(busy)
-        self._set_status("Initializing..." if busy else "")
+    def _reload_log(self) -> None:
+        """Show the active document's log in the shared log panel."""
+        uid = self._current_uid()
+        job = self._jobs.get(uid) if uid else None
+        self._log.setPlainText(job.log if job else "")
+        self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
 
     def _cancel(self) -> None:
-        if self._thread and self._thread.isRunning():
-            self._thread.terminate()
-            self._thread.wait()
-        self._set_busy(False)
+        uid = self._current_uid()
+        job = self._jobs.get(uid) if uid else None
+        if job and job.running:
+            job.thread.terminate()
+            job.thread.wait()
+        if job:
+            job.progress = 0
+            job.status = ""
+            job.detail = ""
+        self._sync_job_ui()
 
     def _ensure_dependency(self, dep: _Dependency) -> bool:
         """Return True if *dep* is available, prompting to install it if not."""
         if all(find_executable(e) for e in dep.executables):
             return True
-        dlg = DependencyDialog(self, dep, log_fn=self._on_log_message)
+        dlg = DependencyDialog(self, dep, log_fn=self._log_message)
         dlg.exec_()
         return dlg.installed
 
@@ -2119,12 +2299,17 @@ class KritaiDocker(DockWidget):
         if not self._ensure_dependency(DEP_REMBG if is_mask else DEP_MFLUX):
             return
 
-        if self._thread and self._thread.isRunning():
-            self._thread.terminate()
-            self._thread.wait()
+        uid = self._doc_uid(doc)
+        job = self._job_for(uid)
 
-        # Clean up previous temp files
-        for path in (self._tmp_input, self._tmp_output):
+        # Only replace this document's run — anything generating in another
+        # document keeps going.
+        if job.running:
+            job.thread.terminate()
+            job.thread.wait()
+
+        # Clean up this document's previous temp files
+        for path in (job.tmp_input, job.tmp_output):
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
@@ -2133,89 +2318,88 @@ class KritaiDocker(DockWidget):
 
         tmp_in = tempfile.NamedTemporaryFile(suffix="_kf_input.png", delete=False)
         tmp_in.close()
-        self._tmp_input = tmp_in.name
+        job.tmp_input = tmp_in.name
 
-        # Don't pre-create the output file — mflux won't overwrite an existing path.
-        self._tmp_output = os.path.join(
-            tempfile.gettempdir(), f"kf_output_{os.getpid()}.png"
+        # Don't pre-create the output file — mflux won't overwrite an existing
+        # path. The counter keeps concurrent runs off each other's output.
+        self._job_counter += 1
+        job.tmp_output = os.path.join(
+            tempfile.gettempdir(), f"kf_output_{os.getpid()}_{self._job_counter}.png"
         )
 
-        self._edit_selection_bounds = None
-        self._active_result_bounds = None
+        job.active_bounds = None
+        job.ratio = None
         if is_mask:
             # Honor an active selection: process only that region and remember
             # where to drop the cutout back on import. No selection → whole canvas.
             sel = doc.selection()
             bounds = None
             if sel and sel.width() > 0 and sel.height() > 0:
-                bounds = _export_selection_crop(doc, self._tmp_input)
+                bounds = _export_selection_crop(doc, job.tmp_input)
             if bounds:
-                self._active_result_bounds = bounds
+                job.active_bounds = bounds
                 _sx, _sy, _sw, _sh = bounds
                 if _sw > 0:
-                    self._preview.setRatio(_sh / _sw)
+                    job.ratio = _sh / _sw
             else:
-                self._export_canvas(doc, self._tmp_input)
-                self._update_preview_ratio(doc)
-            self._start_mask()
+                self._export_canvas(doc, job.tmp_input)
+            self._sync_preview()
+            self._start_mask(job)
             return
 
         if tab == 1:
             sel = doc.selection()
             if sel and sel.width() > 0 and sel.height() > 0:
-                bounds = _export_selection_crop(doc, self._tmp_input)
+                bounds = _export_selection_crop(doc, job.tmp_input)
                 if bounds:
-                    self._edit_selection_bounds = bounds
                     _sx, _sy, _sw, _sh = bounds
                     if _sw > 0:
-                        self._preview.setRatio(_sh / _sw)
+                        job.ratio = _sh / _sw
                 else:
-                    self._export_canvas(doc, self._tmp_input)
+                    self._export_canvas(doc, job.tmp_input)
             else:
-                self._export_canvas(doc, self._tmp_input)
-                self._update_preview_ratio(doc)
+                self._export_canvas(doc, job.tmp_input)
         else:
-            self._export_canvas(doc, self._tmp_input)
+            self._export_canvas(doc, job.tmp_input)
+        self._sync_preview()
 
         if tab == 0:
-            cmd = self._build_generate_cmd(prompt, doc)
+            cmd = self._build_generate_cmd(prompt, doc, job)
         elif tab == 1:
-            cmd = self._build_edit_cmd(prompt, doc)
+            cmd = self._build_edit_cmd(prompt, doc, job)
         else:
-            cmd = self._build_angle_cmd(prompt, doc)
+            cmd = self._build_angle_cmd(prompt, doc, job)
 
-        self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
-        self._gen_start_time = time.monotonic()
-        self._set_busy(True)
-        self._thread = GenerateThread(cmd, self._tmp_output)
-        self._thread.finished.connect(self._on_finished)
-        self._thread.errored.connect(self._on_error)
-        self._thread.logged.connect(self._on_log_message)
-        self._thread.progress.connect(self._on_progress)
-        self._thread.start()
+        self._start_job(job, cmd)
 
-    def _start_mask(self) -> None:
+    def _start_mask(self, job: _DocJob) -> None:
         """Run rembg on the exported canvas, landing a transparent PNG."""
         rembg = find_executable(REMBG_CLI)  # guaranteed by _ensure_dependency
         model = self._mask_model.currentText()
         cmd = [rembg, "i", "-m", model]
         if self._mask_alpha_matting.isChecked():
             cmd.append("-a")
-        cmd += [self._tmp_input, self._tmp_output]
+        cmd += [job.tmp_input, job.tmp_output]
+        self._start_job(job, cmd)
 
-        self._on_log_message(
-            "Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd)
-        )
-        self._gen_start_time = time.monotonic()
-        self._set_busy(True)
-        self._thread = GenerateThread(cmd, self._tmp_output)
-        self._thread.finished.connect(self._on_finished)
-        self._thread.errored.connect(self._on_error)
-        self._thread.logged.connect(self._on_log_message)
-        self._thread.progress.connect(self._on_progress)
-        self._thread.start()
+    def _start_job(self, job: _DocJob, cmd: list[str]) -> None:
+        """Run *cmd* for *job*, routing its signals back to that document."""
+        self._append_log(job.uid, "Running: " + " ".join(
+            f'"{t}"' if " " in t else t for t in cmd))
+        job.start_time = time.monotonic()
+        job.progress = 0
+        job.status = "Initializing..."
+        job.detail = ""
+        job.elapsed = ""
+        job.thread = GenerateThread(cmd, job.tmp_output)
+        job.thread.finished.connect(lambda path, j=job: self._on_finished(j, path))
+        job.thread.errored.connect(lambda msg, j=job: self._on_error(j, msg))
+        job.thread.logged.connect(lambda text, j=job: self._append_log(j.uid, text))
+        job.thread.progress.connect(lambda value, j=job: self._on_progress(j, value))
+        job.thread.start()
+        self._sync_job_ui()
 
-    def _build_generate_cmd(self, prompt: str, doc: object) -> list[str]:
+    def _build_generate_cmd(self, prompt: str, doc: object, job: _DocJob) -> list[str]:
         model_name = self._gen_model.currentText()
         cli_name, model_flag, supports_strength, supports_guidance, *_ = MODEL_CLI.get(
             model_name, ("mflux-generate-flux2", model_name, True, True, False)
@@ -2228,8 +2412,8 @@ class KritaiDocker(DockWidget):
         cmd = [cli_path, "--prompt", prompt]
         if model_flag:
             cmd += ["--model", model_flag]
-        cmd += ["--image-path", self._tmp_input]
-        cmd += ["--steps", str(self._gen_steps.value()), "--output", self._tmp_output]
+        cmd += ["--image-path", job.tmp_input]
+        cmd += ["--steps", str(self._gen_steps.value()), "--output", job.tmp_output]
         if abs(scale - 1.0) >= 0.001:
             cmd += ["--width", str(target_w), "--height", str(target_h)]
         if supports_guidance:
@@ -2243,7 +2427,7 @@ class KritaiDocker(DockWidget):
         cmd += self._get_lora_args(self._gen_lora_entries)
         return cmd
 
-    def _build_edit_cmd(self, prompt: str, doc: object) -> list[str]:
+    def _build_edit_cmd(self, prompt: str, doc: object, job: _DocJob) -> list[str]:
         model_name = self._edit_model.currentText()
         is_base = "base" in model_name
         scale = self._edit_scale.value() / 100
@@ -2253,13 +2437,13 @@ class KritaiDocker(DockWidget):
         # flux2-edit supports --width/--height but dimensions default to the first image
         # when set to "auto". Pre-scale the canvas so the output matches the document size.
         if abs(scale - 1.0) >= 0.001:
-            img = QImage(self._tmp_input)
+            img = QImage(job.tmp_input)
             if not img.isNull():
-                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
+                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(job.tmp_input, "PNG")
 
         cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
         cmd = [cli_path, "--prompt", prompt, "--model", model_name]
-        cmd += ["--image-paths", self._tmp_input]
+        cmd += ["--image-paths", job.tmp_input]
         for enabled_cb, thumb, _ in self._edit_ref_entries:
             if not enabled_cb.isChecked():
                 continue
@@ -2267,7 +2451,7 @@ class KritaiDocker(DockWidget):
             if ref_path:
                 cmd.append(ref_path)
 
-        cmd += ["--steps", str(self._edit_steps.value()), "--output", self._tmp_output]
+        cmd += ["--steps", str(self._edit_steps.value()), "--output", job.tmp_output]
         if is_base:
             cmd += ["--guidance", str(self._edit_guidance.value())]
         if (q := self._quantize_value(self._edit_quantize)) is not None:
@@ -2277,7 +2461,7 @@ class KritaiDocker(DockWidget):
         cmd += self._get_lora_args(self._edit_lora_entries)
         return cmd
 
-    def _build_angle_cmd(self, prompt: str, doc: object) -> list[str]:
+    def _build_angle_cmd(self, prompt: str, doc: object, job: _DocJob) -> list[str]:
         model_name = self._angle_model.currentText()
         is_base = "base" in model_name
         scale = self._angle_scale.value() / 100
@@ -2287,19 +2471,19 @@ class KritaiDocker(DockWidget):
         # flux2-edit uses --image-paths and doesn't support --width/--height,
         # so pre-scale the input image when needed.
         if abs(scale - 1.0) >= 0.001:
-            img = QImage(self._tmp_input)
+            img = QImage(job.tmp_input)
             if not img.isNull():
-                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(self._tmp_input, "PNG")
+                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(job.tmp_input, "PNG")
 
         cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
         cmd = [
             cli_path,
             "--prompt", prompt,
             "--model", model_name,
-            "--image-paths", self._tmp_input,
+            "--image-paths", job.tmp_input,
             "--steps", str(self._angle_steps.value()),
             "--guidance", str(self._angle_guidance.value()) if is_base else "1.0",
-            "--output", self._tmp_output,
+            "--output", job.tmp_output,
         ]
         if (q := self._quantize_value(self._angle_quantize)) is not None:
             cmd += ["--quantize", str(q)]
@@ -2310,46 +2494,62 @@ class KritaiDocker(DockWidget):
     def _build_edit_prompt(self) -> str:
         return self._edit_prompt.toPlainText().strip()
 
-    def _on_finished(self, output_path: str) -> None:
-        self._set_busy(False)
+    def _on_finished(self, job: _DocJob, output_path: str) -> None:
+        job.status = ""
+        job.detail = ""
         exists = os.path.exists(output_path)
         size = os.path.getsize(output_path) if exists else 0
-        self._on_log_message(
+        self._append_log(
+            job.uid,
             f"Output path: {output_path}\n"
             f"File exists: {exists}, size: {size} bytes"
         )
-        self._show_preview(output_path)
+        self._store_preview(job.uid, output_path)
         # Remember where this result should land on import (a selection-scoped
         # cutout goes back at its bounds; everything else is full-canvas).
-        if self._current_doc:
-            uid = self._current_doc.fileName() or str(id(self._current_doc))
-            self._result_bounds[uid] = self._active_result_bounds
-        elapsed = time.monotonic() - self._gen_start_time
+        self._result_bounds[job.uid] = job.active_bounds
+        elapsed = time.monotonic() - job.start_time
         minutes, seconds = divmod(int(elapsed), 60)
-        self._time_label.setText(f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s")
-        self._time_label.setVisible(True)
-        self._progress.setVisible(False)
+        job.elapsed = f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+        job.progress = 100
+        self._sync_job_ui()
 
-        if self._edit_selection_bounds:
-            self._edit_selection_bounds = None
+    def _on_error(self, job: _DocJob, message: str) -> None:
+        job.status = "Error — see Logs."
+        job.detail = ""
+        job.progress = 0
+        self._sync_job_ui()
+        # Auto-expand the log panel on error so the user notices it — but only
+        # when the failing document is the one on screen.
+        if job.uid == self._current_uid():
+            self._log_btn.setChecked(True)
 
-    def _on_error(self, message: str) -> None:
-        self._set_busy(False)
-        self._set_status("Error — see Logs.")
-        # Auto-expand the log panel on error so the user notices it.
-        self._log_btn.setChecked(True)
+    def _log_message(self, text: str) -> None:
+        """Log against the active document (installs, upscales, ad-hoc notes)."""
+        self._append_log(self._current_uid(), text)
 
-    def _on_log_message(self, text: str) -> None:
-        if text:
+    def _append_log(self, uid: Optional[str], text: str) -> None:
+        if not text:
+            return
+        job = self._job_for(uid) if uid else None
+        if job is not None:
+            job.log += text + "\n"
+        downloading = ("%|" not in text
+                       and any(kw in text for kw in ("Downloading", "Fetching", "fetching")))
+        if downloading and job is not None:
+            job.status = "Downloading…"
+        if uid is None or uid == self._current_uid():
             self._log.appendPlainText(text)
             self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
-            if any(kw in text for kw in ("Downloading", "Fetching", "fetching")):
-                self._set_status("Downloading…")
+            if downloading:
+                self._progress.setFormat("Downloading…")
 
-    def _on_progress(self, value: int) -> None:
-        self._progress.setValue(value)
-        if value > 0:
-            self._set_status(f"Generating… {value}%")
+    def _on_progress(self, job: _DocJob, value: int, status: str, detail: str) -> None:
+        job.progress = value
+        job.status = status
+        job.detail = detail
+        if job.uid == self._current_uid():
+            self._sync_job_ui()
 
     def _on_log_toggled(self, checked: bool) -> None:
         self._log.setVisible(checked)
@@ -2360,23 +2560,44 @@ class KritaiDocker(DockWidget):
         QApplication.clipboard().setText(self._log.toPlainText())
 
     def _clear_log(self) -> None:
+        uid = self._current_uid()
+        job = self._jobs.get(uid) if uid else None
+        if job:
+            job.log = ""
         self._log.clear()
 
     # ------------------------------------------------------------------
     # Preview
     # ------------------------------------------------------------------
 
-    def _show_preview(self, path: str) -> None:
+    def _store_preview(self, uid: str, path: str) -> None:
+        """Keep the result for *uid*, showing it if that document is on screen."""
         pixmap = QPixmap(path)
         if pixmap.isNull():
-            self._set_status("Could not load result image.")
+            self._job_for(uid).status = "Could not load result image."
             return
-        self._preview.setPixmap(pixmap)
-        self._preview.setVisible(True)
-        self._use_btn.setEnabled(True)
-        self._clear_preview_btn.setEnabled(True)
-        if self._current_doc:
-            self._doc_previews[self._current_doc.fileName() or str(id(self._current_doc))] = pixmap
+        self._doc_previews[uid] = pixmap
+        if uid == self._current_uid():
+            self._sync_preview()
+
+    def _sync_preview(self) -> None:
+        """Show the active document's result (or nothing) in the preview."""
+        uid = self._current_uid()
+        job = self._jobs.get(uid) if uid else None
+        if job and job.ratio:
+            self._preview.setRatio(job.ratio)
+        elif self._current_doc:
+            self._update_preview_ratio(self._current_doc)
+        pixmap = self._doc_previews.get(uid) if uid else None
+        if pixmap:
+            self._preview.setPixmap(pixmap)
+            self._preview.setVisible(True)
+            self._use_btn.setEnabled(True)
+            self._clear_preview_btn.setEnabled(True)
+        else:
+            self._preview.clearPixmap()
+            self._use_btn.setEnabled(False)
+            self._clear_preview_btn.setEnabled(False)
 
     def _clear_preview(self) -> None:
         reply = QMessageBox.question(
@@ -2387,24 +2608,29 @@ class KritaiDocker(DockWidget):
         )
         if reply != QMessageBox.Yes:
             return
-        self._preview.clearPixmap()
-        self._time_label.setVisible(False)
-        self._use_btn.setEnabled(False)
-        self._clear_preview_btn.setEnabled(False)
-        if self._current_doc:
-            uid = self._current_doc.fileName() or str(id(self._current_doc))
+        uid = self._current_uid()
+        if uid:
             self._doc_previews.pop(uid, None)
             self._result_bounds.pop(uid, None)
+            job = self._jobs.get(uid)
+            if job:
+                job.elapsed = ""
+                job.status = ""
+                job.detail = ""
+                job.ratio = None
+        self._sync_preview()
+        self._sync_job_ui()
 
     def _import_to_layer(self) -> None:
         doc = self._current_doc
         if not doc:
             return
-        pixmap = self._doc_previews.get(doc.fileName() or str(id(doc)))
+        uid = self._doc_uid(doc)
+        pixmap = self._doc_previews.get(uid)
         if not pixmap:
             return
 
-        uid = doc.fileName() or str(id(doc))
+        job = self._jobs.get(uid)
 
         # Determine scale from the active tab.
         tab = self._tabs.currentIndex()
@@ -2419,9 +2645,10 @@ class KritaiDocker(DockWidget):
 
         can_upscale = (
             scale < 1.0
-            and self._tmp_output
-            and os.path.exists(self._tmp_output)
-            and not (self._thread and self._thread.isRunning())
+            and job is not None
+            and job.tmp_output
+            and os.path.exists(job.tmp_output)
+            and not job.running
         )
 
         # Restore previous upscale settings for this document.
@@ -2535,7 +2762,7 @@ class KritaiDocker(DockWidget):
             cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-seedvr2")
             cmd = [
                 cli_path,
-                "--image-path", self._tmp_output,
+                "--image-path", job.tmp_output,
                 "--resolution", f"{upscale_factor}x",
                 "--output", upscaled_path,
             ]
@@ -2547,20 +2774,21 @@ class KritaiDocker(DockWidget):
             if not dlg_random_seed.isChecked():
                 cmd += ["--seed", str(dlg_seed.value())]
 
-            self._on_log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
+            self._log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
 
             thread = GenerateThread(cmd, upscaled_path)
             # Keep a reference so it isn't garbage-collected.
             dlg._thread = thread
 
-            def on_upscale_progress(value):
+            def on_upscale_progress(value, status, detail):
                 dlg_progress.setValue(value)
-                if value > 0:
-                    dlg_progress.setFormat(f"Generating… {value}%")
+                dlg_progress.setFormat(f"{status} · {detail}" if detail else status)
 
             def on_upscale_log(text):
-                self._on_log_message(text)
-                if any(kw in text for kw in ("Downloading", "Fetching", "fetching")):
+                self._append_log(uid, text)
+                if "%|" not in text and any(
+                    kw in text for kw in ("Downloading", "Fetching", "fetching")
+                ):
                     dlg_progress.setFormat("Downloading…")
 
             thread.progress.connect(on_upscale_progress)
@@ -2573,7 +2801,8 @@ class KritaiDocker(DockWidget):
                 dlg.accept()
 
             def on_error(msg):
-                self._on_error(msg)
+                if job is not None:
+                    self._on_error(job, msg)
                 dlg.reject()
 
             thread.finished.connect(on_finished)
@@ -2597,7 +2826,7 @@ class KritaiDocker(DockWidget):
         if img.isNull():
             return
 
-        uid = doc.fileName() or str(id(doc))
+        uid = self._doc_uid(doc)
         bounds = self._result_bounds.get(uid)
 
         layer = doc.createNode("Kritai Result", "paintlayer")
@@ -2781,24 +3010,13 @@ class KritaiDocker(DockWidget):
         from krita import Krita
         self._current_doc = Krita.instance().activeDocument() if canvas is not None else None
         if self._current_doc:
-            self._update_preview_ratio(self._current_doc)
             self._load_settings(self._current_doc)
-            cached = self._doc_previews.get(self._current_doc.fileName() or str(id(self._current_doc)))
-            if cached:
-                self._preview.setPixmap(cached)
-                self._preview.setVisible(True)
-                self._use_btn.setEnabled(True)
-                self._clear_preview_btn.setEnabled(True)
-            else:
-                self._preview.clearPixmap()
-                self._time_label.setVisible(False)
-                self._use_btn.setEnabled(False)
-                self._clear_preview_btn.setEnabled(False)
-        else:
-            self._preview.clearPixmap()
-            self._time_label.setVisible(False)
-            self._use_btn.setEnabled(False)
-            self._clear_preview_btn.setEnabled(False)
+        # Swap the shared preview, progress and log widgets over to the newly
+        # active document. Whatever the other documents are generating keeps
+        # running, and its progress is waiting when the user comes back.
+        self._sync_preview()
+        self._reload_log()
+        self._sync_job_ui()
         self._update_generate_btn()
 
 
