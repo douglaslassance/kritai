@@ -2889,8 +2889,10 @@ class KritaiDocker(DockWidget):
             dlg._thread = thread
 
             def on_upscale_progress(value, status, detail):
+                # Just the headline — the bar is one line wide, and the byte
+                # counts are in the log.
                 dlg_progress.setValue(max(0, value))
-                dlg_progress.setFormat(f"{status} · {detail}" if detail else status)
+                dlg_progress.setFormat(status)
 
             def on_upscale_log(text):
                 self._append_log(uid, text)
