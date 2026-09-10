@@ -7,6 +7,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -661,7 +662,8 @@ class _ProgressParser:
     of PCT_UNKNOWN means no bar knows a total yet.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, verb: str = "Generating") -> None:
+        self.verb = verb
         self._pct = PCT_UNKNOWN
         self._sized = ""       # "1.00GB/6.00GB", from a bar that knows its total
         self._moved = ""       # "1.09GB", from a bar that only counts bytes
@@ -669,7 +671,7 @@ class _ProgressParser:
         self._files = ""
 
     def _reset(self) -> None:
-        self.__init__()
+        self.__init__(self.verb)
 
     def feed(self, m: re.Match) -> Optional[tuple[int, str, str]]:
         """Fold a matched tqdm bar into the picture and report it."""
@@ -695,7 +697,7 @@ class _ProgressParser:
             detail = f"step {counts}" if not desc else counts
             if eta:
                 detail += f" · {eta} left"
-            return pct, f"{desc or 'Generating'}{suffix}", detail
+            return pct, f"{desc or self.verb}{suffix}", detail
 
         if rates:
             # The last rate is huggingface_hub's own postfix, which aggregates
@@ -725,10 +727,41 @@ class GenerateThread(QThread):
     logged = pyqtSignal(str)            # line of stdout/stderr for the log panel
     progress = pyqtSignal(int, str, str)  # 0–100, status line, detail line
 
-    def __init__(self, cmd: list[str], output_path: str) -> None:
+    def __init__(self, cmd: list[str], output_path: str, verb: str = "Generating") -> None:
         super().__init__()
         self.cmd = cmd
         self.output_path = output_path
+        self.verb = verb
+        self._proc: Optional[subprocess.Popen] = None
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        """Ask the CLI to stop and let run() unwind.
+
+        QThread.terminate() only kills the thread — the CLI it spawned keeps
+        running as an orphan, still downloading weights and still holding the
+        cache locks the next run needs.
+        """
+        self._cancelled = True
+        self._signal_proc(signal.SIGTERM)
+
+    def kill(self) -> None:
+        """Follow up on a cancel the CLI ignored."""
+        self._signal_proc(signal.SIGKILL)
+
+    def _signal_proc(self, sig: int) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            # The CLI starts helpers of its own (multiprocessing), so signal
+            # the whole group it was given by start_new_session.
+            os.killpg(os.getpgid(proc.pid), sig)
+        except OSError:
+            try:
+                proc.send_signal(sig)
+            except OSError:
+                pass
 
     def run(self) -> None:
         try:
@@ -750,10 +783,12 @@ class GenerateThread(QThread):
                 stderr=subprocess.PIPE,
                 text=True,
                 env=clean_env,
+                start_new_session=True,  # its own group, so cancel gets the helpers too
             )
+            self._proc = proc
 
             stderr_lines = []
-            parser = _ProgressParser()
+            parser = _ProgressParser(self.verb)
 
             def drain_stderr():
                 for raw in proc.stderr:
@@ -786,12 +821,17 @@ class GenerateThread(QThread):
             if stdout.strip():
                 self.logged.emit(stdout.strip())
 
+            if self._cancelled:
+                return
+
             if proc.returncode != 0:
                 self.errored.emit("\n".join(stderr_lines).strip() or "mflux-generate failed")
             else:
                 self.progress.emit(100, "Finishing…", "")
                 self.finished.emit(self.output_path)
         except Exception as e:
+            if self._cancelled:
+                return
             self.logged.emit(str(e))
             self.errored.emit(str(e))
 
@@ -2015,7 +2055,10 @@ class KritaiDocker(DockWidget):
                 break
 
     def _on_application_closing(self) -> None:
-        """Flush settings for all open documents before Krita quits."""
+        """Flush settings and stop any running CLI before Krita quits."""
+        for job in self._jobs.values():
+            if job.thread:
+                self._stop_thread(job.thread)
         self._save_settings()
         for doc in Krita.instance().documents():
             if doc.fileName():
@@ -2309,12 +2352,21 @@ class KritaiDocker(DockWidget):
         self._log.setPlainText(job.log if job else "")
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
 
+    @staticmethod
+    def _stop_thread(thread: GenerateThread) -> None:
+        """Stop a run and its CLI, escalating if the CLI ignores the first ask."""
+        if not thread.isRunning():
+            return
+        thread.cancel()
+        if not thread.wait(3000):
+            thread.kill()
+            thread.wait(2000)
+
     def _cancel(self) -> None:
         uid = self._current_uid()
         job = self._jobs.get(uid) if uid else None
-        if job and job.running:
-            job.thread.terminate()
-            job.thread.wait()
+        if job and job.thread:
+            self._stop_thread(job.thread)
         if job:
             job.progress = 0
             job.status = ""
@@ -2360,9 +2412,8 @@ class KritaiDocker(DockWidget):
 
         # Only replace this document's run — anything generating in another
         # document keeps going.
-        if job.running:
-            job.thread.terminate()
-            job.thread.wait()
+        if job.thread:
+            self._stop_thread(job.thread)
 
         # Clean up this document's previous temp files
         for path in (job.tmp_input, job.tmp_output):
@@ -2436,9 +2487,9 @@ class KritaiDocker(DockWidget):
         if self._mask_alpha_matting.isChecked():
             cmd.append("-a")
         cmd += [job.tmp_input, job.tmp_output]
-        self._start_job(job, cmd)
+        self._start_job(job, cmd, verb="Removing background")
 
-    def _start_job(self, job: _DocJob, cmd: list[str]) -> None:
+    def _start_job(self, job: _DocJob, cmd: list[str], verb: str = "Generating") -> None:
         """Run *cmd* for *job*, routing its signals back to that document."""
         self._append_log(job.uid, "Running: " + " ".join(
             f'"{t}"' if " " in t else t for t in cmd))
@@ -2447,7 +2498,7 @@ class KritaiDocker(DockWidget):
         job.status = "Initializing..."
         job.detail = ""
         job.elapsed = ""
-        job.thread = GenerateThread(cmd, job.tmp_output)
+        job.thread = GenerateThread(cmd, job.tmp_output, verb=verb)
         job.thread.finished.connect(lambda path, j=job: self._on_finished(j, path))
         job.thread.errored.connect(lambda msg, j=job: self._on_error(j, msg))
         job.thread.logged.connect(lambda text, j=job: self._append_log(j.uid, text))
@@ -2833,7 +2884,7 @@ class KritaiDocker(DockWidget):
 
             self._log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
 
-            thread = GenerateThread(cmd, upscaled_path)
+            thread = GenerateThread(cmd, upscaled_path, verb="Upscaling")
             # Keep a reference so it isn't garbage-collected.
             dlg._thread = thread
 
@@ -2868,7 +2919,7 @@ class KritaiDocker(DockWidget):
 
         buttons.accepted.connect(on_import)
         buttons.rejected.connect(lambda: (
-            dlg._thread.terminate() if hasattr(dlg, '_thread') and dlg._thread.isRunning() else None,
+            self._stop_thread(dlg._thread) if hasattr(dlg, "_thread") else None,
             dlg.reject()
         ))
 
