@@ -2933,6 +2933,42 @@ class KritaiDocker(DockWidget):
 
         dlg.exec_()
 
+    @staticmethod
+    def _image_rows(img: QImage, row_bytes: int) -> bytes:
+        """Raw rows of *img* with Qt's per-row padding removed."""
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())
+        raw = bytes(ptr)
+        stride = img.bytesPerLine()
+        if stride == row_bytes:
+            return raw
+        return b"".join(
+            raw[y * stride:y * stride + row_bytes] for y in range(img.height())
+        )
+
+    @classmethod
+    def _layer_pixels(cls, img: QImage, model: str, depth: str) -> Optional[bytes]:
+        """*img* packed the way a layer in this document's colour space reads it.
+
+        setPixelData hands the buffer straight to the layer, so it has to be in
+        the layer's own format. That is BGRA for RGBA/U8 and gray+alpha pairs
+        for GRAYA/U8. Handing four-byte BGRA to a grayscale layer is what used
+        to import as streaked noise. Returns None for a space we can't pack.
+        """
+        if depth != "U8":
+            return None
+        w, h = img.width(), img.height()
+        if model == "RGBA":
+            return cls._image_rows(img, w * 4)
+        if model == "GRAYA":
+            gray = cls._image_rows(img.convertToFormat(QImage.Format_Grayscale8), w)
+            alpha = cls._image_rows(img.convertToFormat(QImage.Format_Alpha8), w)
+            packed = bytearray(w * h * 2)
+            packed[0::2] = gray
+            packed[1::2] = alpha
+            return bytes(packed)
+        return None
+
     def _commit_to_layer(self, pixmap: QPixmap) -> None:
         doc = self._current_doc
         if not doc:
@@ -2944,25 +2980,29 @@ class KritaiDocker(DockWidget):
 
         uid = self._doc_uid(doc)
         bounds = self._result_bounds.get(uid)
-
-        layer = doc.createNode("Kritai Result", "paintlayer")
-        doc.rootNode().addChildNode(layer, None)
-
         if bounds:
             # Selection-scoped cutout: drop it back at its original position,
             # native size, on an otherwise-transparent full-canvas layer.
             x, y, w, h = bounds
-            if img.width() != w or img.height() != h:
-                img = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            ptr = img.bits()
-            ptr.setsize(img.byteCount())
-            layer.setPixelData(bytes(ptr), x, y, w, h)
         else:
-            if img.width() != doc.width() or img.height() != doc.height():
-                img = img.scaled(doc.width(), doc.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-            ptr = img.bits()
-            ptr.setsize(img.byteCount())
-            layer.setPixelData(bytes(ptr), 0, 0, img.width(), img.height())
+            x, y, w, h = 0, 0, doc.width(), doc.height()
+        if img.width() != w or img.height() != h:
+            img = img.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+
+        model, depth = doc.colorModel(), doc.colorDepth()
+        data = self._layer_pixels(img, model, depth)
+        if data is None:
+            message = (
+                f"Kritai can't import into a {model}/{depth} document yet. "
+                "Convert the image to RGBA or Grayscale 8-bit first."
+            )
+            self._log_message(message)
+            QMessageBox.warning(self, "Import as Layer", message)
+            return
+
+        layer = doc.createNode("Kritai Result", "paintlayer")
+        doc.rootNode().addChildNode(layer, None)
+        layer.setPixelData(data, x, y, w, h)
 
         doc.refreshProjection()
 
