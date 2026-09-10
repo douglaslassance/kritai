@@ -2395,7 +2395,8 @@ class KritaiDocker(DockWidget):
         job.thread.finished.connect(lambda path, j=job: self._on_finished(j, path))
         job.thread.errored.connect(lambda msg, j=job: self._on_error(j, msg))
         job.thread.logged.connect(lambda text, j=job: self._append_log(j.uid, text))
-        job.thread.progress.connect(lambda value, j=job: self._on_progress(j, value))
+        job.thread.progress.connect(
+            lambda value, status, detail, j=job: self._on_progress(j, value, status, detail))
         job.thread.start()
         self._sync_job_ui()
 
