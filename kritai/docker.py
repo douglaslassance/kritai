@@ -2911,9 +2911,15 @@ class KritaiDocker(DockWidget):
                 dlg.accept()
 
             def on_error(msg):
-                if job is not None:
-                    self._on_error(job, msg)
-                dlg.reject()
+                # A failed upscale shouldn't cost the user the result: keep the
+                # dialog up with Upscale turned off, so Import brings the image
+                # in at the size it already has.
+                self._append_log(uid, msg)
+                upscale_group.setChecked(False)
+                upscale_group.setEnabled(False)
+                buttons.button(QDialogButtonBox.Ok).setEnabled(True)
+                dlg_progress.setValue(0)
+                dlg_progress.setFormat("Upscale failed — see Logs. Import uses the original.")
 
             thread.finished.connect(on_finished)
             thread.errored.connect(on_error)
