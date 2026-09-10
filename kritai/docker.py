@@ -2289,10 +2289,10 @@ class KritaiDocker(DockWidget):
         job = self._jobs.get(uid) if uid else None
         running = bool(job and job.running)
         showing = running or bool(job and job.status)
-        # A download with no known total gets a busy bar instead of a still 0%.
-        busy = bool(job and job.progress == PCT_UNKNOWN)
-        self._progress.setRange(0, 0 if busy else 100)
-        self._progress.setValue(0 if busy else (job.progress if job else 0))
+        # An unknown percentage sits at zero rather than switching the bar to
+        # Qt's busy mode, which hides the text — the moving detail line is what
+        # tells the user it is alive.
+        self._progress.setValue(max(0, job.progress) if job else 0)
         self._progress.setFormat(job.status if job else "")
         self._progress.setVisible(showing)
         self._progress_detail.setText(job.detail if job else "")
@@ -2838,7 +2838,6 @@ class KritaiDocker(DockWidget):
             dlg._thread = thread
 
             def on_upscale_progress(value, status, detail):
-                dlg_progress.setRange(0, 0 if value == PCT_UNKNOWN else 100)
                 dlg_progress.setValue(max(0, value))
                 dlg_progress.setFormat(f"{status} · {detail}" if detail else status)
 
