@@ -612,97 +612,111 @@ class CollapsibleSection(QWidget):
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 # Bars reaching us on stderr, in the shapes they actually arrive in. mflux
-# draws the denoising steps with plain tqdm, while huggingface_hub draws the
-# weight download — over Xet on current versions, which spaces out its counts,
-# drops the rate, and omits the percentage until it knows the total:
+# draws the denoising steps with plain tqdm; huggingface_hub draws the weight
+# download, over Xet on current versions, which runs two bars at once — one
+# reconstructing the file (knows the total) and one counting network bytes
+# (deliberately has none, since dedup makes it unpredictable) — and puts the
+# speed in a postfix rather than tqdm's usual bracket:
+#   model.safetensors: reconstructing file:  17%|█▋  | 1.00GB / 6.00GB, 12.3MB/s
+#   model.safetensors: downloading bytes: █▊  | 1.09GB, 13.1MB/s
+#   Downloading (incomplete total...):  17%|█▋  | 1.00G/6.00G [00:00<00:03, 1.6GB/s, 12.3MB/s]
 #   Fetching 17 files:  12%|█▏        | 2/17 [00:03<00:24,  3.30it/s]
-#   Downloading (incomplete total...):  36%|███▌ | 3.60G/10.0G [00:04<00:07, 5.91GB/s]
-#   Reconstructing (incomplete total...):  64%|██████▍  | 18.6kB / 29.0kB
-#   Downloading bytes:           |  0.00B
 #    50%|█████     | 2/4 [00:00<00:00,  3.29it/s]
 _TQDM_RE = re.compile(
     r"^(?P<desc>.*?):?\s*"
-    r"(?:(?P<pct>\d{1,3})%)?"                          # absent when no total yet
-    r"\s*\|[^|]*?\|?\s*"                              # the bar, one or both pipes
+    r"(?:(?P<pct>\d{1,3})%)?\s*"
+    r"\|[^|]*?\|?\s*"                                  # the bar, one or both pipes
     r"(?P<n>[\d.]+\s?[A-Za-z]*)"
-    r"(?:\s*/\s*(?P<total>[\d.]+\s?[A-Za-z]*))?"      # total, when known
-    r"(?:\s*\[(?P<elapsed>[^<\]]*)<(?P<remaining>[^,\]]*),\s*(?P<rate>[^\]]*)\])?"
+    r"(?:\s*/\s*(?P<total>[\d.]+\s?[A-Za-z]*))?"       # total, when the bar has one
+    r"(?P<tail>.*)$"
 )
-# A count like "1.04kB" or a rate like "5.91GB/s" means the bar is measuring a
+# Before it knows a total, tqdm drops the bar entirely: "desc: 0.00B [00:00, ?B/s]".
+_TQDM_NOBAR_RE = re.compile(
+    r"^(?P<desc>.*?):?\s*(?P<pct>)(?P<total>)"
+    r"(?P<n>[\d.]+\s?[A-Za-z]*)\s*(?P<tail>\[[^\]]*\])\s*$"
+)
+# A count like "1.04kB" or a rate like "12.3MB/s" means the bar measures a
 # download rather than progress through the generation.
 _BYTE_RE = re.compile(r"^[\d.]+\s?[kKMGTP]?i?B$")
-_BYTE_RATE_RE = re.compile(r"[kKMGTP]?B/s$")
+_BYTE_RATE_RE = re.compile(r"[\d.]+\s?[kKMGTP]?i?B/s")
+_ETA_RE = re.compile(r"<\s*(?P<eta>[\d:]+)")
 # Whatever huggingface_hub calls the phase, it is fetching weights.
 _DOWNLOAD_WORDS = ("download", "reconstruct", "fetching")
 
 PCT_UNKNOWN = -1
 
 
+def _match_bar(line: str) -> Optional[re.Match]:
+    return _TQDM_RE.match(line) or _TQDM_NOBAR_RE.match(line)
+
+
 class _ProgressParser:
     """Turns tqdm bars on stderr into (percent, status, detail) updates.
 
-    A weight download draws several bars at once: one counting bytes overall,
-    one counting the files, and on Xet one more for reassembling them. The bar
-    that knows its total is the only useful headline, so it drives the
-    percentage and the rest become detail. A percentage of PCT_UNKNOWN means
-    leave the bar where it is — the download has no total to measure against
-    yet.
+    A download draws several bars at once and they refresh independently, so
+    picking one as the source of truth leaves the display frozen whenever a
+    different one happens to be the only thing moving. Instead every bar folds
+    into one picture — total from whichever bar knows it, bytes off the wire,
+    speed, file count — and any refresh reports the whole of it. A percentage
+    of PCT_UNKNOWN means no bar knows a total yet.
     """
 
     def __init__(self) -> None:
-        self._files = ""           # e.g. "2 of 17 files"
-        self._downloading = False  # a byte bar with a total is reporting
+        self._pct = PCT_UNKNOWN
+        self._sized = ""       # "1.00GB/6.00GB", from a bar that knows its total
+        self._moved = ""       # "1.09GB", from a bar that only counts bytes
+        self._rate = ""
+        self._files = ""
+
+    def _reset(self) -> None:
+        self.__init__()
 
     def feed(self, m: re.Match) -> Optional[tuple[int, str, str]]:
-        """Turn a matched tqdm bar into an update, or None if it says nothing new."""
+        """Fold a matched tqdm bar into the picture and report it."""
         raw_pct = m.group("pct")
-        pct = min(100, int(raw_pct)) if raw_pct is not None else PCT_UNKNOWN
+        pct = min(100, int(raw_pct)) if raw_pct else PCT_UNKNOWN
         desc = (m.group("desc") or "").split(":")[0].strip()
-        n, total = m.group("n"), m.group("total")
-        rate = (m.group("rate") or "").strip()
-        remaining = (m.group("remaining") or "").strip()
-        eta = f" · {remaining} left" if remaining and "?" not in remaining else ""
+        n = (m.group("n") or "").strip()
+        total = (m.group("total") or "").strip()
+        tail = m.group("tail") or ""
         desc_l = desc.lower()
 
+        rates = _BYTE_RATE_RE.findall(tail)
+        eta_m = _ETA_RE.search(tail)
+        eta = eta_m.group("eta") if eta_m else ""
+
         is_files = desc_l.startswith("fetching")
-        is_bytes = bool(
-            _BYTE_RE.match(n.strip())
-            or (total and _BYTE_RE.match(total.strip()))
-            or _BYTE_RATE_RE.search(rate)
-        )
-        is_download = is_bytes or is_files or any(w in desc_l for w in _DOWNLOAD_WORDS)
+        is_bytes = bool(_BYTE_RE.match(n) or (total and _BYTE_RE.match(total)) or rates)
+        if not (is_bytes or is_files or any(w in desc_l for w in _DOWNLOAD_WORDS)):
+            # Progress through the generation itself.
+            self._reset()
+            counts = f"{n} of {total}" if total else n
+            suffix = "" if pct == PCT_UNKNOWN else f"… {pct}%"
+            detail = f"step {counts}" if not desc else counts
+            if eta:
+                detail += f" · {eta} left"
+            return pct, f"{desc or 'Generating'}{suffix}", detail
 
-        if is_download and not is_files:
-            if total is None:
-                # No total to measure against — a bar that has one is better.
-                if self._downloading:
-                    return None
-                return PCT_UNKNOWN, "Downloading…", n.strip()
-            self._downloading = True
-            detail = f"{n.strip()}/{total.strip()}"
-            if rate and "?" not in rate:
-                detail += f" · {rate}"
-            detail += eta
-            if self._files:
-                detail += f" · {self._files}"
-            status = "Downloading…" if pct == PCT_UNKNOWN else f"Downloading… {pct}%"
-            return pct, status, detail
-
+        if rates:
+            # The last rate is huggingface_hub's own postfix, which aggregates
+            # every file; anything before it is tqdm's per-bar estimate.
+            self._rate = rates[-1].strip()
         if is_files:
-            self._files = f"{n.strip()} of {total.strip()} files" if total else ""
-            if self._downloading:
-                return None  # a byte bar is already reporting this download
-            status = "Downloading…" if pct == PCT_UNKNOWN else f"Downloading… {pct}%"
-            return pct, status, self._files + eta
+            self._files = f"{n} of {total} files" if total else ""
+            if not self._sized and pct != PCT_UNKNOWN:
+                self._pct = pct
+        elif total:
+            self._sized = f"{n}/{total}"
+            if pct != PCT_UNKNOWN:
+                self._pct = pct
+        else:
+            self._moved = n
 
-        # Anything else is progress through the generation itself.
-        self._files = ""
-        self._downloading = False
-        counts = f"{n.strip()} of {total.strip()}" if total else n.strip()
-        suffix = "" if pct == PCT_UNKNOWN else f"… {pct}%"
-        if desc:
-            return pct, f"{desc}{suffix}", counts + eta
-        return pct, f"Generating{suffix}", f"step {counts}{eta}"
+        parts = [self._sized or (f"{self._moved} downloaded" if self._moved else "")]
+        parts += [self._rate, self._files, f"{eta} left" if eta else ""]
+        detail = " · ".join(part for part in parts if part)
+        status = "Downloading…" if self._pct == PCT_UNKNOWN else f"Downloading… {self._pct}%"
+        return self._pct, status, detail
 
 
 class GenerateThread(QThread):
@@ -746,7 +760,7 @@ class GenerateThread(QThread):
                     line = _ANSI_RE.sub("", raw).strip()
                     if not line:
                         continue
-                    m = _TQDM_RE.match(line)
+                    m = _match_bar(line)
                     if m is not None:
                         update = parser.feed(m)
                         if update is not None:
@@ -755,7 +769,7 @@ class GenerateThread(QThread):
                         # and ends, not every frame in between. Warnings get
                         # printed straight onto a bar's line, so keep any text
                         # trailing the bar even when the bar itself is dropped.
-                        if m.group("pct") not in ("0", "100"):
+                        if (m.group("pct") or "") not in ("0", "100"):
                             rest = line[m.end():].strip()
                             if not rest:
                                 continue
@@ -2275,7 +2289,10 @@ class KritaiDocker(DockWidget):
         job = self._jobs.get(uid) if uid else None
         running = bool(job and job.running)
         showing = running or bool(job and job.status)
-        self._progress.setValue(job.progress if job else 0)
+        # A download with no known total gets a busy bar instead of a still 0%.
+        busy = bool(job and job.progress == PCT_UNKNOWN)
+        self._progress.setRange(0, 0 if busy else 100)
+        self._progress.setValue(0 if busy else (job.progress if job else 0))
         self._progress.setFormat(job.status if job else "")
         self._progress.setVisible(showing)
         self._progress_detail.setText(job.detail if job else "")
@@ -2537,6 +2554,7 @@ class KritaiDocker(DockWidget):
     def _on_finished(self, job: _DocJob, output_path: str) -> None:
         job.status = ""
         job.detail = ""
+        job.progress = 100
         exists = os.path.exists(output_path)
         size = os.path.getsize(output_path) if exists else 0
         self._append_log(
@@ -2551,7 +2569,6 @@ class KritaiDocker(DockWidget):
         elapsed = time.monotonic() - job.start_time
         minutes, seconds = divmod(int(elapsed), 60)
         job.elapsed = f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
-        job.progress = 100
         self._sync_job_ui()
 
     def _on_error(self, job: _DocJob, message: str) -> None:
@@ -2574,7 +2591,7 @@ class KritaiDocker(DockWidget):
         job = self._job_for(uid) if uid else None
         if job is not None:
             job.log += text + "\n"
-        downloading = (_TQDM_RE.match(text) is None
+        downloading = (_match_bar(text) is None
                        and any(kw in text for kw in ("Downloading", "Fetching", "fetching")))
         if downloading and job is not None:
             job.status = "Downloading…"
@@ -2585,8 +2602,7 @@ class KritaiDocker(DockWidget):
                 self._progress.setFormat("Downloading…")
 
     def _on_progress(self, job: _DocJob, value: int, status: str, detail: str) -> None:
-        if value != PCT_UNKNOWN:
-            job.progress = value
+        job.progress = value
         job.status = status
         job.detail = detail
         if job.uid == self._current_uid():
@@ -2822,12 +2838,13 @@ class KritaiDocker(DockWidget):
             dlg._thread = thread
 
             def on_upscale_progress(value, status, detail):
-                dlg_progress.setValue(value)
+                dlg_progress.setRange(0, 0 if value == PCT_UNKNOWN else 100)
+                dlg_progress.setValue(max(0, value))
                 dlg_progress.setFormat(f"{status} · {detail}" if detail else status)
 
             def on_upscale_log(text):
                 self._append_log(uid, text)
-                if _TQDM_RE.match(text) is None and any(
+                if _match_bar(text) is None and any(
                     kw in text for kw in ("Downloading", "Fetching", "fetching")
                 ):
                     dlg_progress.setFormat("Downloading…")
