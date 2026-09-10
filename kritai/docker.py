@@ -629,7 +629,10 @@ _TQDM_RE = re.compile(
     r"\|[^|]*?\|?\s*"                                  # the bar, one or both pipes
     r"(?P<n>[\d.]+\s?[A-Za-z]*)"
     r"(?:\s*/\s*(?P<total>[\d.]+\s?[A-Za-z]*))?"       # total, when the bar has one
-    r"(?P<tail>.*)$"
+    # Stop at the bar's own trailer, either tqdm's bracket or a "…, 13.1MB/s"
+    # postfix, so text printed onto the same line stays outside the match and
+    # can still reach the log.
+    r"(?P<tail>(?:\s*\[[^\]]*\])?(?:\s*,[^,\[\]]*)*)"
 )
 # Before it knows a total, tqdm drops the bar entirely: "desc: 0.00B [00:00, ?B/s]".
 _TQDM_NOBAR_RE = re.compile(
@@ -640,7 +643,6 @@ _TQDM_NOBAR_RE = re.compile(
 # download rather than progress through the generation.
 _BYTE_RE = re.compile(r"^[\d.]+\s?[kKMGTP]?i?B$")
 _BYTE_RATE_RE = re.compile(r"[\d.]+\s?[kKMGTP]?i?B/s")
-_ETA_RE = re.compile(r"<\s*(?P<eta>[\d:]+)")
 # Whatever huggingface_hub calls the phase, it is fetching weights.
 _DOWNLOAD_WORDS = ("download", "reconstruct", "fetching")
 
@@ -652,28 +654,26 @@ def _match_bar(line: str) -> Optional[re.Match]:
 
 
 class _ProgressParser:
-    """Turns tqdm bars on stderr into (percent, status, detail) updates.
+    """Turns tqdm bars on stderr into (percent, status) updates.
 
     A download draws several bars at once and they refresh independently, so
     picking one as the source of truth leaves the display frozen whenever a
     different one happens to be the only thing moving. Instead every bar folds
-    into one picture — total from whichever bar knows it, bytes off the wire,
-    speed, file count — and any refresh reports the whole of it. A percentage
-    of PCT_UNKNOWN means no bar knows a total yet.
+    into one picture, and any refresh reports it. A percentage of PCT_UNKNOWN
+    means no bar knows a total yet, in which case the bytes received so far
+    stand in for it.
     """
 
     def __init__(self, verb: str = "Generating") -> None:
         self.verb = verb
         self._pct = PCT_UNKNOWN
-        self._sized = ""       # "1.00GB/6.00GB", from a bar that knows its total
-        self._moved = ""       # "1.09GB", from a bar that only counts bytes
-        self._rate = ""
-        self._files = ""
+        self._moved = ""        # bytes off the wire, when no bar knows a total
+        self._has_total = False
 
     def _reset(self) -> None:
         self.__init__(self.verb)
 
-    def feed(self, m: re.Match) -> Optional[tuple[int, str, str]]:
+    def feed(self, m: re.Match) -> Optional[tuple[int, str]]:
         """Fold a matched tqdm bar into the picture and report it."""
         raw_pct = m.group("pct")
         pct = min(100, int(raw_pct)) if raw_pct else PCT_UNKNOWN
@@ -684,48 +684,38 @@ class _ProgressParser:
         desc_l = desc.lower()
 
         rates = _BYTE_RATE_RE.findall(tail)
-        eta_m = _ETA_RE.search(tail)
-        eta = eta_m.group("eta") if eta_m else ""
-
         is_files = desc_l.startswith("fetching")
         is_bytes = bool(_BYTE_RE.match(n) or (total and _BYTE_RE.match(total)) or rates)
         if not (is_bytes or is_files or any(w in desc_l for w in _DOWNLOAD_WORDS)):
             # Progress through the generation itself.
             self._reset()
-            counts = f"{n} of {total}" if total else n
             suffix = "" if pct == PCT_UNKNOWN else f"… {pct}%"
-            detail = f"step {counts}" if not desc else counts
-            if eta:
-                detail += f" · {eta} left"
-            return pct, f"{desc or self.verb}{suffix}", detail
+            return pct, f"{desc or self.verb}{suffix}"
 
-        if rates:
-            # The last rate is huggingface_hub's own postfix, which aggregates
-            # every file; anything before it is tqdm's per-bar estimate.
-            self._rate = rates[-1].strip()
         if is_files:
-            self._files = f"{n} of {total} files" if total else ""
-            if not self._sized and pct != PCT_UNKNOWN:
+            if not self._has_total and pct != PCT_UNKNOWN:
                 self._pct = pct
         elif total:
-            self._sized = f"{n}/{total}"
+            self._has_total = True
             if pct != PCT_UNKNOWN:
                 self._pct = pct
         else:
+            # Nothing knows a total yet, so the byte count is the only sign of
+            # life. It goes in the headline rather than on a second line.
             self._moved = n
 
-        parts = [self._sized or (f"{self._moved} downloaded" if self._moved else "")]
-        parts += [self._rate, self._files, f"{eta} left" if eta else ""]
-        detail = " · ".join(part for part in parts if part)
-        status = "Downloading…" if self._pct == PCT_UNKNOWN else f"Downloading… {self._pct}%"
-        return self._pct, status, detail
+        if self._pct != PCT_UNKNOWN:
+            return self._pct, f"Downloading… {self._pct}%"
+        if self._moved:
+            return self._pct, f"Downloading… {self._moved}"
+        return self._pct, "Downloading…"
 
 
 class GenerateThread(QThread):
     finished = pyqtSignal(str)          # output path
     errored = pyqtSignal(str)           # error message
     logged = pyqtSignal(str)            # line of stdout/stderr for the log panel
-    progress = pyqtSignal(int, str, str)  # 0–100, status line, detail line
+    progress = pyqtSignal(int, str)     # 0–100 (or PCT_UNKNOWN), status line
 
     def __init__(self, cmd: list[str], output_path: str, verb: str = "Generating") -> None:
         super().__init__()
@@ -827,7 +817,7 @@ class GenerateThread(QThread):
             if proc.returncode != 0:
                 self.errored.emit("\n".join(stderr_lines).strip() or "mflux-generate failed")
             else:
-                self.progress.emit(100, "Finishing…", "")
+                self.progress.emit(100, "Finishing…")
                 self.finished.emit(self.output_path)
         except Exception as e:
             if self._cancelled:
@@ -1094,8 +1084,8 @@ class _DocJob:
         self.start_time: float = 0.0
         self.progress: int = 0
         self.status: str = ""
-        self.detail: str = ""
         self.elapsed: str = ""
+        self.cancelled: bool = False
         self.log: str = ""
         # Where the in-flight result should land on import: (x, y, w, h) for a
         # selection-scoped cutout, or None for a full-canvas result.
@@ -1283,13 +1273,6 @@ class KritaiDocker(DockWidget):
         self._cancel_btn.clicked.connect(self._cancel)
         progress_row.addWidget(self._cancel_btn)
         outer.addLayout(progress_row)
-
-        # Byte counts, speed and ETA for whatever the progress bar is tracking.
-        self._progress_detail = QLabel()
-        self._progress_detail.setWordWrap(True)
-        self._progress_detail.setStyleSheet("color: #888; font-size: 11px;")
-        self._progress_detail.setVisible(False)
-        outer.addWidget(self._progress_detail)
 
         # --- Log section ---
         self._log = QPlainTextEdit()
@@ -2333,13 +2316,11 @@ class KritaiDocker(DockWidget):
         running = bool(job and job.running)
         showing = running or bool(job and job.status)
         # An unknown percentage sits at zero rather than switching the bar to
-        # Qt's busy mode, which hides the text — the moving detail line is what
-        # tells the user it is alive.
+        # Qt's busy mode, which hides the text. The status carries the bytes
+        # received in that case, so the bar still shows it is alive.
         self._progress.setValue(max(0, job.progress) if job else 0)
         self._progress.setFormat(job.status if job else "")
         self._progress.setVisible(showing)
-        self._progress_detail.setText(job.detail if job else "")
-        self._progress_detail.setVisible(showing and bool(job and job.detail))
         self._cancel_btn.setEnabled(running)
         self._cancel_btn.setVisible(running)
         self._time_label.setText(job.elapsed if job else "")
@@ -2368,9 +2349,9 @@ class KritaiDocker(DockWidget):
         if job and job.thread:
             self._stop_thread(job.thread)
         if job:
+            job.cancelled = True
             job.progress = 0
             job.status = ""
-            job.detail = ""
         self._sync_job_ui()
 
     def _ensure_dependency(self, dep: _Dependency) -> bool:
@@ -2496,14 +2477,14 @@ class KritaiDocker(DockWidget):
         job.start_time = time.monotonic()
         job.progress = 0
         job.status = "Initializing..."
-        job.detail = ""
         job.elapsed = ""
+        job.cancelled = False
         job.thread = GenerateThread(cmd, job.tmp_output, verb=verb)
         job.thread.finished.connect(lambda path, j=job: self._on_finished(j, path))
         job.thread.errored.connect(lambda msg, j=job: self._on_error(j, msg))
         job.thread.logged.connect(lambda text, j=job: self._append_log(j.uid, text))
         job.thread.progress.connect(
-            lambda value, status, detail, j=job: self._on_progress(j, value, status, detail))
+            lambda value, status, j=job: self._on_progress(j, value, status))
         job.thread.start()
         self._sync_job_ui()
 
@@ -2604,7 +2585,6 @@ class KritaiDocker(DockWidget):
 
     def _on_finished(self, job: _DocJob, output_path: str) -> None:
         job.status = ""
-        job.detail = ""
         job.progress = 100
         exists = os.path.exists(output_path)
         size = os.path.getsize(output_path) if exists else 0
@@ -2624,7 +2604,6 @@ class KritaiDocker(DockWidget):
 
     def _on_error(self, job: _DocJob, message: str) -> None:
         job.status = "Error — see Logs."
-        job.detail = ""
         job.progress = 0
         self._sync_job_ui()
         # Auto-expand the log panel on error so the user notices it — but only
@@ -2652,10 +2631,13 @@ class KritaiDocker(DockWidget):
             if downloading:
                 self._progress.setFormat("Downloading…")
 
-    def _on_progress(self, job: _DocJob, value: int, status: str, detail: str) -> None:
+    def _on_progress(self, job: _DocJob, value: int, status: str) -> None:
+        # A cancelled run can still have updates queued; taking them would put
+        # its progress bar back on screen after it was dismissed.
+        if job.cancelled:
+            return
         job.progress = value
         job.status = status
-        job.detail = detail
         if job.uid == self._current_uid():
             self._sync_job_ui()
 
@@ -2724,7 +2706,6 @@ class KritaiDocker(DockWidget):
             if job:
                 job.elapsed = ""
                 job.status = ""
-                job.detail = ""
                 job.ratio = None
         self._sync_preview()
         self._sync_job_ui()
@@ -2888,7 +2869,7 @@ class KritaiDocker(DockWidget):
             # Keep a reference so it isn't garbage-collected.
             dlg._thread = thread
 
-            def on_upscale_progress(value, status, detail):
+            def on_upscale_progress(value, status):
                 # Just the headline — the bar is one line wide, and the byte
                 # counts are in the log.
                 dlg_progress.setValue(max(0, value))
