@@ -1,6 +1,6 @@
 # Kritai
 
-A Krita plugin that sends your canvas through a local [mflux](https://github.com/filipstrand/mflux) image-to-image pipeline and displays the result.
+A Krita plugin that sends your canvas through a local [mflux](https://github.com/mflux-community/mflux) image-to-image pipeline and displays the result.
 
 This project is similar to the [Interstice](https://www.interstice.cloud/) plugin, but has different goals and is less ambitious in scope. Main focuses are:
 
