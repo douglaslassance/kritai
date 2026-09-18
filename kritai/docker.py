@@ -57,28 +57,19 @@ from PyQt5.QtWidgets import (
 
 MFLUX_DIR = os.path.expanduser("~/.local/bin")
 
-# Maps model name → (cli_binary, model_flag, supports_strength, supports_guidance, needs_reference_image).
-# Distilled models (klein, schnell) don't accept a variable guidance scale.
-# Models with needs_reference_image=True use --image-paths [canvas, ref…] instead of --image-path canvas.
 MODEL_CLI = {
-    # FLUX.2 — distilled variants: no guidance; base variants: guidance ok
     "flux2-klein-4b":      ("mflux-generate-flux2",      "flux2-klein-4b",      True,  False, False),
     "flux2-klein-9b":      ("mflux-generate-flux2",      "flux2-klein-9b",      True,  False, False),
     "flux2-klein-9b-kv":   ("mflux-generate-flux2",      "flux2-klein-9b-kv",   True,  False, False),
     "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True,  False),
     "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
-    # FLUX.2 edit — canvas + optional reference image via --image-paths.
-    # Model is chosen at runtime via the Edit tab's model selector.
     "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, True,  True),
 }
 
-# Which models belong to which tab.
 GENERATE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
 EDIT_MODELS = ["flux2-edit"]
 
-# Models available in the Edit and Angle tabs (must be compatible with mflux-generate-flux2-edit).
-# flux2-klein-9b-kv is the KV-cached 9B checkpoint, which only pays off on the edit CLI,
-# so it is offered here and not in the Generate tab. Requires mflux 0.18.0 or newer.
+# flux2-klein-9b-kv is the KV-cached 9B checkpoint; must suit mflux-generate-flux2-edit.
 ANGLE_MODELS = [
     "flux2-klein-4b",
     "flux2-klein-9b",
@@ -87,18 +78,13 @@ ANGLE_MODELS = [
     "flux2-klein-base-9b",
 ]
 
-# --- External tool discovery ------------------------------------------------
-
-# `uv tool install` and Homebrew drop binaries in a handful of well-known dirs
-# that Krita's minimal (Finder-launched) PATH often doesn't include, so we
-# search them explicitly rather than relying on PATH alone.
+# Krita Finder-launched PATH often omits where uv and Homebrew drop binaries.
 _TOOL_SEARCH_DIRS = [
     MFLUX_DIR,                              # uv tool install / pipx default
     "/opt/homebrew/bin",                   # Homebrew on Apple Silicon
     "/usr/local/bin",                      # Homebrew on Intel
     os.path.expanduser("~/.cargo/bin"),
 ]
-
 
 def find_executable(name: str) -> Optional[str]:
     """Full path to *name* if it's installed, else ``None``.
@@ -115,16 +101,8 @@ def find_executable(name: str) -> Optional[str]:
             return candidate
     return None
 
-
-# --- rembg (background removal, Mask tab) -----------------------------------
-
-# Console script installed by ``uv tool install "rembg[cli]"``.
 REMBG_CLI = "rembg"
 
-# Curated subset of rembg's models, best-first: quality / balanced / fast.
-# Names must match rembg's ``-m`` values exactly. Weights download on first
-# use into ~/.u2net/. (rembg ships many more niche models — anime, portrait,
-# human-seg, etc. — deliberately not exposed here to keep the choice simple.)
 MASK_MODELS = [
     "birefnet-general",
     "isnet-general-use",
@@ -163,11 +141,8 @@ ANGLE_PRESETS = {
     "Bottom": (0,    -90, 100),
 }
 
-# How often (ms) to poll canvas for changes when auto-mode is on.
 POLL_INTERVAL_MS = 1500
-# How long (ms) to wait after the last detected change before generating.
 DEBOUNCE_MS = 2000
-
 
 class PreviewLabel(QLabel):
     """QLabel that paints its pixmap centered with correct aspect ratio."""
@@ -235,7 +210,6 @@ class PreviewLabel(QLabel):
             y = (self.height() - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
 
-
 class _AdaptiveTabWidget(QTabWidget):
     """QTabWidget whose size hint tracks the active tab only.
 
@@ -265,7 +239,6 @@ class _AdaptiveTabWidget(QTabWidget):
             max(content.height() + h_extra, tab_bar.sizeHint().height() + 20),
         )
 
-
 class CameraOrbitWidget(QWidget):
     """Interactive 3D orbit widget: drag the teal dot to rotate azimuth,
     the magenta dot (camera) to change elevation, the amber dot to zoom."""
@@ -274,7 +247,6 @@ class CameraOrbitWidget(QWidget):
     elevation_changed = pyqtSignal(int)   # –90 – 90
     distance_changed  = pyqtSignal(int)   # 60 – 180
 
-    # Fixed isometric view direction (not user-controllable)
     _VY = math.radians(30)   # scene yaw  (rotate world around Y before projecting)
     _VP = math.radians(25)   # view pitch (tilt camera down)
 
@@ -298,8 +270,6 @@ class CameraOrbitWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
         self.setMouseTracking(True)
 
-    # ------------------------------------------------------------------ api
-
     def setAzimuth(self, v: int) -> None:
         v = max(-180, min(180, int(v)))
         if self._az != v:
@@ -321,8 +291,6 @@ class CameraOrbitWidget(QWidget):
     def azimuth(self)  -> int: return self._az
     def elevation(self) -> int: return self._el
     def distance(self)  -> int: return self._dist
-
-    # --------------------------------------------------------- 3-D math
 
     def _scale(self) -> float:
         return min(self.width(), self.height()) * 0.35
@@ -356,13 +324,9 @@ class CameraOrbitWidget(QWidget):
         vy = self._VY
         return -x * math.sin(vy) + z * math.cos(vy)
 
-    # ------------------------------------------------ handle screen positions
-
     def _pos_handle(self) -> QPointF:
         """Camera position projected onto screen — sits on the elevation arc."""
         return self._project(*self._cam_xyz())
-
-    # --------------------------------------------------------------- painting
 
     def _palette_colors(self):
         """Return (bg, grid, ring, arc) derived from the live Qt palette."""
@@ -443,8 +407,6 @@ class CameraOrbitWidget(QWidget):
         p.setBrush(QBrush(accent))
         p.drawEllipse(self._pos_handle(), r, r)
 
-    # -------------------------------------------------------- mouse events
-
     def enterEvent(self, event) -> None:
         self._hovered = True
         self.update()
@@ -487,7 +449,6 @@ class CameraOrbitWidget(QWidget):
         if event.button() == Qt.LeftButton:
             self._drag = None
             self.setCursor(Qt.ArrowCursor)
-
 
 class DropThumbnail(QLabel):
     """64x64 label that accepts image drops and clicks to browse."""
@@ -562,7 +523,6 @@ class DropThumbnail(QLabel):
                 self.setImagePath(path)
                 return
 
-
 class CollapsibleSection(QWidget):
     """A full-width accordion-style collapsible section."""
 
@@ -574,7 +534,6 @@ class CollapsibleSection(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # Header row: toggle + optional extra widgets
         self._header_row = QHBoxLayout()
         self._header_row.setContentsMargins(0, 0, 0, 0)
         self._header_row.setSpacing(2)
@@ -588,7 +547,6 @@ class CollapsibleSection(QWidget):
 
         outer.addLayout(self._header_row)
 
-        # Content area
         self._content = QWidget()
         self._content.setVisible(False)
         outer.addWidget(self._content)
@@ -609,49 +567,28 @@ class CollapsibleSection(QWidget):
         self._content.setVisible(checked)
         self._toggle.setText(("▼" if checked else "▶") + f"  {self._title}")
 
-
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
-# Bars reaching us on stderr, in the shapes they actually arrive in. mflux
-# draws the denoising steps with plain tqdm; huggingface_hub draws the weight
-# download, over Xet on current versions, which runs two bars at once — one
-# reconstructing the file (knows the total) and one counting network bytes
-# (deliberately has none, since dedup makes it unpredictable) — and puts the
-# speed in a postfix rather than tqdm's usual bracket:
-#   model.safetensors: reconstructing file:  17%|█▋  | 1.00GB / 6.00GB, 12.3MB/s
-#   model.safetensors: downloading bytes: █▊  | 1.09GB, 13.1MB/s
-#   Downloading (incomplete total...):  17%|█▋  | 1.00G/6.00G [00:00<00:03, 1.6GB/s, 12.3MB/s]
-#   Fetching 17 files:  12%|█▏        | 2/17 [00:03<00:24,  3.30it/s]
-#    50%|█████     | 2/4 [00:00<00:00,  3.29it/s]
 _TQDM_RE = re.compile(
     r"^(?P<desc>.*?):?\s*"
     r"(?:(?P<pct>\d{1,3})%)?\s*"
     r"\|[^|]*?\|?\s*"                                  # the bar, one or both pipes
     r"(?P<n>[\d.]+\s?[A-Za-z]*)"
     r"(?:\s*/\s*(?P<total>[\d.]+\s?[A-Za-z]*))?"       # total, when the bar has one
-    # Stop at the bar's own trailer, either tqdm's bracket or a "…, 13.1MB/s"
-    # postfix, so text printed onto the same line stays outside the match and
-    # can still reach the log.
     r"(?P<tail>(?:\s*\[[^\]]*\])?(?:\s*,[^,\[\]]*)*)"
 )
-# Before it knows a total, tqdm drops the bar entirely: "desc: 0.00B [00:00, ?B/s]".
 _TQDM_NOBAR_RE = re.compile(
     r"^(?P<desc>.*?):?\s*(?P<pct>)(?P<total>)"
     r"(?P<n>[\d.]+\s?[A-Za-z]*)\s*(?P<tail>\[[^\]]*\])\s*$"
 )
-# A count like "1.04kB" or a rate like "12.3MB/s" means the bar measures a
-# download rather than progress through the generation.
 _BYTE_RE = re.compile(r"^[\d.]+\s?[kKMGTP]?i?B$")
 _BYTE_RATE_RE = re.compile(r"[\d.]+\s?[kKMGTP]?i?B/s")
-# Whatever huggingface_hub calls the phase, it is fetching weights.
 _DOWNLOAD_WORDS = ("download", "reconstruct", "fetching")
 
 PCT_UNKNOWN = -1
 
-
 def _match_bar(line: str) -> Optional[re.Match]:
     return _TQDM_RE.match(line) or _TQDM_NOBAR_RE.match(line)
-
 
 class _ProgressParser:
     """Turns tqdm bars on stderr into (percent, status) updates.
@@ -687,7 +624,6 @@ class _ProgressParser:
         is_files = desc_l.startswith("fetching")
         is_bytes = bool(_BYTE_RE.match(n) or (total and _BYTE_RE.match(total)) or rates)
         if not (is_bytes or is_files or any(w in desc_l for w in _DOWNLOAD_WORDS)):
-            # Progress through the generation itself.
             self._reset()
             suffix = "" if pct == PCT_UNKNOWN else f"… {pct}%"
             return pct, f"{desc or self.verb}{suffix}"
@@ -700,8 +636,6 @@ class _ProgressParser:
             if pct != PCT_UNKNOWN:
                 self._pct = pct
         else:
-            # Nothing knows a total yet, so the byte count is the only sign of
-            # life. It goes in the headline rather than on a second line.
             self._moved = n
 
         if self._pct != PCT_UNKNOWN:
@@ -709,7 +643,6 @@ class _ProgressParser:
         if self._moved:
             return self._pct, f"Downloading… {self._moved}"
         return self._pct, "Downloading…"
-
 
 class GenerateThread(QThread):
     finished = pyqtSignal(str)          # output path
@@ -744,8 +677,6 @@ class GenerateThread(QThread):
         if proc is None or proc.poll() is not None:
             return
         try:
-            # The CLI starts helpers of its own (multiprocessing), so signal
-            # the whole group it was given by start_new_session.
             os.killpg(os.getpgid(proc.pid), sig)
         except OSError:
             try:
@@ -755,16 +686,10 @@ class GenerateThread(QThread):
 
     def run(self) -> None:
         try:
-            # Strip Krita's Python environment variables so they don't bleed
-            # into the mflux subprocess (causes SRE module mismatch otherwise).
             clean_env = {
                 k: v for k, v in os.environ.items()
                 if k not in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE")
             }
-            # huggingface_hub turns its download bars off when stderr isn't a
-            # TTY, which is always the case here — TQDM_POSITION=-1 is its
-            # documented way back in. The interval throttles the refreshes so
-            # a long download doesn't flood the pipe.
             clean_env["TQDM_POSITION"] = "-1"
             clean_env["TQDM_MININTERVAL"] = "0.5"
             proc = subprocess.Popen(
@@ -790,10 +715,6 @@ class GenerateThread(QThread):
                         update = parser.feed(m)
                         if update is not None:
                             self.progress.emit(*update)
-                        # A bar refreshes twice a second; log where it starts
-                        # and ends, not every frame in between. Warnings get
-                        # printed straight onto a bar's line, so keep any text
-                        # trailing the bar even when the bar itself is dropped.
                         if (m.group("pct") or "") not in ("0", "100"):
                             rest = line[m.end():].strip()
                             if not rest:
@@ -825,12 +746,6 @@ class GenerateThread(QThread):
             self.logged.emit(str(e))
             self.errored.emit(str(e))
 
-
-# ======================================================================
-# Dependency detection + one-click install
-# ======================================================================
-
-
 class _Dependency:
     """A CLI tool Kritai shells out to, plus how to install it."""
 
@@ -843,7 +758,6 @@ class _Dependency:
         self.reason = reason            # one-line "why it's needed"
         self.install_args = install_args or []  # extra flags for `uv tool install`
 
-
 DEP_MFLUX = _Dependency(
     "mflux",
     # 0.18.0 added the flux2-klein-9b-kv checkpoint the Edit and Angle tabs offer.
@@ -854,18 +768,12 @@ DEP_MFLUX = _Dependency(
 )
 DEP_REMBG = _Dependency(
     "rembg",
-    # [cli] gives the command; [cpu] pulls the onnxruntime inference backend
-    # (rembg 2.x split it into cpu/gpu extras) — without it `rembg i` errors
-    # with "No onnxruntime backend found".
     "rembg[cli,cpu]",
     [REMBG_CLI],
     "https://github.com/danielgatis/rembg",
     "Background removal in the Mask tab runs through the rembg CLI.",
-    # rembg -> pymatting -> numba: without this floor uv backtracks to an
-    # ancient numba whose llvmlite has no Python 3.12 wheel and fails to build.
     install_args=["--with", "numba>=0.60"],
 )
-
 
 class InstallThread(QThread):
     """Runs a sequence of shell commands, streaming output; stops on first failure."""
@@ -905,7 +813,6 @@ class InstallThread(QThread):
                 return
         self.done.emit(True)
 
-
 class DependencyDialog(QDialog):
     """Explains a missing CLI dependency and offers a one-click install.
 
@@ -932,9 +839,6 @@ class DependencyDialog(QDialog):
         brew = find_executable("brew")
         self._commands = self._plan_commands(dep, uv, brew)
 
-        # Shell-quote for display/copy so pasting into zsh doesn't glob on the
-        # brackets in specs like rembg[cli]. (The actual install runs argv-style
-        # via subprocess, so it's unaffected either way.)
         def _fmt(cmd):
             return " ".join(shlex.quote(tok) for tok in cmd)
 
@@ -1022,8 +926,6 @@ class DependencyDialog(QDialog):
         self._log_fn(text)
 
     def _on_done(self, ok: bool) -> None:
-        # Trust the filesystem, not just the exit code: uv may succeed yet land
-        # the binary somewhere we didn't expect.
         self.installed = all(find_executable(e) for e in self._dep.executables)
         self._close_btn.setEnabled(True)
         if self.installed:
@@ -1035,7 +937,6 @@ class DependencyDialog(QDialog):
                 "Installation did not complete — see the log above, or run the "
                 "command manually."
             )
-
 
 class _FocusOutSignal(QObject):
     """Emits focusLost when the watched widget loses focus."""
@@ -1050,22 +951,15 @@ class _FocusOutSignal(QObject):
             self.focusLost.emit()
         return False
 
-
-# ======================================================================
-# Helpers to snap continuous angle values to the nearest discrete option.
-# ======================================================================
-
 def _snap_to_nearest(value: int, mapping: list[tuple[int, str]]) -> str:
     """Return the description for the nearest key in *mapping*."""
     return min(mapping, key=lambda kv: abs(value - kv[0]))[1]
-
 
 def _snap_to_nearest_wrap(value: int, mapping: list[tuple[int, str]], wrap: int = 360) -> str:
     """Return the description for the nearest key, wrapping around *wrap*."""
     def dist(kv):
         return min(abs(value - kv[0]), wrap - abs(value - kv[0]))
     return min(mapping, key=dist)[1]
-
 
 class _DocJob:
     """Generation state for a single document.
@@ -1087,16 +981,12 @@ class _DocJob:
         self.elapsed: str = ""
         self.cancelled: bool = False
         self.log: str = ""
-        # Where the in-flight result should land on import: (x, y, w, h) for a
-        # selection-scoped cutout, or None for a full-canvas result.
         self.active_bounds: Optional[tuple] = None
-        # Preview aspect ratio (height / width) for this document's result.
         self.ratio: Optional[float] = None
 
     @property
     def running(self) -> bool:
         return bool(self.thread and self.thread.isRunning())
-
 
 class KritaiDocker(DockWidget):
 
@@ -1108,25 +998,17 @@ class KritaiDocker(DockWidget):
         self._doc_previews: dict[str, QPixmap] = {}
         self._doc_settings: dict[str, dict] = {}
         self._upscale_settings: dict[str, dict] = {}
-        # Generation state per document, so runs in several documents can be
-        # in flight at once and each keeps its own progress, log and result.
         self._jobs: dict[str, _DocJob] = {}
         self._job_counter = 0
-        # Where a result should land on import: (x, y, w, h) for a selection-
-        # scoped cutout, or None for a full-canvas result. Tracked per document
-        # (keyed like _doc_previews) so it survives until the user clicks Use.
         self._result_bounds: dict[str, Optional[tuple]] = {}
 
-        # Flush settings to annotation on save and on application close.
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
         Krita.instance().notifier().applicationClosing.connect(self._on_application_closing)
 
-        # Polling timer: checks canvas content periodically when auto is on.
         self._poll_timer = QTimer()
         self._poll_timer.setInterval(POLL_INTERVAL_MS)
         self._poll_timer.timeout.connect(self._poll_canvas)
 
-        # Debounce timer: fires after inactivity to trigger generation.
         self._debounce_timer = QTimer()
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(DEBOUNCE_MS)
@@ -1134,10 +1016,6 @@ class KritaiDocker(DockWidget):
 
         self._build_ui()
         self._connect_settings_signals()
-
-    # ------------------------------------------------------------------
-    # Per-document state
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _doc_uid(doc: object) -> str:
@@ -1164,10 +1042,6 @@ class KritaiDocker(DockWidget):
         if job is not None:
             job.uid = new_uid
 
-    # ------------------------------------------------------------------
-    # UI
-    # ------------------------------------------------------------------
-
     def _build_ui(self) -> None:
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1182,7 +1056,6 @@ class KritaiDocker(DockWidget):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(6)
 
-        # --- Tab widget ---
         self._tabs = _AdaptiveTabWidget()
         self._tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self._tabs.addTab(self._build_generate_tab(), "Generate")
@@ -1209,7 +1082,6 @@ class KritaiDocker(DockWidget):
         self._tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self._tabs)
 
-        # --- Buttons ---
         btn_row = QHBoxLayout()
         outer.addLayout(btn_row)
 
@@ -1228,7 +1100,6 @@ class KritaiDocker(DockWidget):
         self._generate_btn.setDefault(True)
         btn_row.addWidget(self._generate_btn)
         btn_row.addWidget(self._auto_btn)
-
 
         self._clear_preview_btn = QToolButton()
         self._clear_preview_btn.setToolTip("Clear preview")
@@ -1254,7 +1125,6 @@ class KritaiDocker(DockWidget):
         self._log_btn.toggled.connect(self._on_log_toggled)
         btn_row.addWidget(self._log_btn)
 
-        # --- Progress bar + cancel button ---
         progress_row = QHBoxLayout()
         progress_row.setContentsMargins(0, 0, 0, 0)
         progress_row.setSpacing(4)
@@ -1274,7 +1144,6 @@ class KritaiDocker(DockWidget):
         progress_row.addWidget(self._cancel_btn)
         outer.addLayout(progress_row)
 
-        # --- Log section ---
         self._log = QPlainTextEdit()
         self._log.setReadOnly(True)
         self._log.setMinimumHeight(120)
@@ -1295,7 +1164,6 @@ class KritaiDocker(DockWidget):
         log_btns_layout.addWidget(self._clear_btn)
         log_btns_layout.addStretch()
 
-        # --- Preview image — placed directly under progress, above log ---
         self._preview = PreviewLabel()
         self._preview.setAlignment(Qt.AlignCenter)
         self._preview.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -1317,17 +1185,12 @@ class KritaiDocker(DockWidget):
 
         self._update_generate_btn()
 
-    # ------------------------------------------------------------------
-    # Tab builders
-    # ------------------------------------------------------------------
-
     def _build_generate_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # --- Model selector ---
         self._gen_model = QComboBox()
         model_tooltips = {
             "flux2-klein-4b":      "Fast distilled 4B model. Good default for quick iterations. No guidance.",
@@ -1342,14 +1205,11 @@ class KritaiDocker(DockWidget):
         self._gen_model.setCurrentIndex(0)
         self._gen_model.currentIndexChanged.connect(self._update_generate_tab_ui)
 
-        # --- Prompt ---
         self._gen_prompt = QPlainTextEdit()
         self._gen_prompt.setPlaceholderText("Prompt...")
         self._gen_prompt.setToolTip("Describe what you want the image to look like.")
         self._gen_prompt.setFixedHeight(60)
 
-
-        # --- Settings form ---
         settings_widget = QWidget()
         form = QFormLayout(settings_widget)
         form.setContentsMargins(0, 0, 0, 0)
@@ -1407,7 +1267,6 @@ class KritaiDocker(DockWidget):
         layout.addWidget(self._gen_prompt)
         layout.addWidget(settings_widget)
 
-        # --- LoRA section ---
         gen_lora_section = CollapsibleSection("LoRAs")
         gen_lora_content = QVBoxLayout()
         gen_lora_content.setSpacing(4)
@@ -1435,12 +1294,10 @@ class KritaiDocker(DockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # --- Prompt ---
         self._edit_prompt = QPlainTextEdit()
         self._edit_prompt.setPlaceholderText("Prompt...")
         self._edit_prompt.setFixedHeight(60)
 
-        # --- Settings form ---
         settings_widget = QWidget()
         form = QFormLayout(settings_widget)
         form.setContentsMargins(0, 0, 0, 0)
@@ -1500,7 +1357,6 @@ class KritaiDocker(DockWidget):
         layout.addWidget(self._edit_prompt)
         layout.addWidget(settings_widget)
 
-        # --- Reference images (flux2-edit only) ---
         self._edit_ref_section = CollapsibleSection("Reference Images")
         ref_content = QVBoxLayout()
         ref_content.setSpacing(4)
@@ -1518,7 +1374,6 @@ class KritaiDocker(DockWidget):
         self._edit_ref_section.setVisible(False)
         layout.addWidget(self._edit_ref_section)
 
-        # --- LoRA section ---
         edit_lora_section = CollapsibleSection("LoRAs")
         edit_lora_content = QVBoxLayout()
         edit_lora_content.setSpacing(4)
@@ -1546,29 +1401,23 @@ class KritaiDocker(DockWidget):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
 
-        # --- 3-D orbit widget + angle controls side by side ---
         orbit_row = QHBoxLayout()
         orbit_row.setSpacing(8)
 
         self._orbit = CameraOrbitWidget()
         orbit_row.addWidget(self._orbit)
 
-        # Numeric readouts (synced to orbit widget).
         cam_form = QFormLayout()
         cam_form.setContentsMargins(0, 0, 0, 0)
         cam_form.setSpacing(4)
         cam_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         cam_form.setHorizontalSpacing(8)
-        # On macOS the default is ExpandingFieldsGrow (only Expanding-policy
-        # widgets grow).  Force AllNonFixedFieldsGrow so that our Preferred-
-        # policy row widgets also fill the available right-column width.
+        # macOS defaults to ExpandingFieldsGrow, which only grows Expanding-policy widgets.
         cam_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         def _int_slider_row(lo, hi, default, suffix, tooltip):
             row = QWidget()
-            # Expanding policy is required for AllNonFixedFieldsGrow to stretch
-            # the row to fill the right column (Preferred alone is not enough on
-            # macOS even with AllNonFixedFieldsGrow).
+            # Expanding is required for AllNonFixedFieldsGrow to stretch the row on macOS.
             row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
             hl  = QHBoxLayout(row)
             hl.setContentsMargins(0, 0, 0, 0)
@@ -1581,7 +1430,6 @@ class KritaiDocker(DockWidget):
             spin.setRange(lo, hi)
             spin.setValue(default)
             spin.setSuffix(suffix)
-            # Keep the spinbox compact so the slider has room in narrow dockers.
             spin.setFixedWidth(50)
             spin.setToolTip(tooltip)
             slider.valueChanged.connect(spin.setValue)
@@ -1612,8 +1460,6 @@ class KritaiDocker(DockWidget):
         cam_form_widget.setLayout(cam_form)
         cam_form_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
-        # Right column: sliders only — wrapped in a widget so the HBoxLayout
-        # can stretch it properly.
         right_col_widget = QWidget()
         right_col_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         right_col = QVBoxLayout(right_col_widget)
@@ -1626,8 +1472,6 @@ class KritaiDocker(DockWidget):
         orbit_row.setAlignment(Qt.AlignTop)
         layout.addLayout(orbit_row)
 
-        # Preset buttons span the full content width so they never force the
-        # right column (and therefore the orbit row) to be too wide.
         preset_row = QHBoxLayout()
         preset_row.setSpacing(3)
         preset_row.setContentsMargins(0, 0, 0, 0)
@@ -1638,7 +1482,6 @@ class KritaiDocker(DockWidget):
             preset_row.addWidget(btn, stretch=1)
         layout.addLayout(preset_row)
 
-        # --- Settings form ---
         settings_widget = QWidget()
         form = QFormLayout(settings_widget)
         form.setContentsMargins(0, 0, 0, 0)
@@ -1694,10 +1537,6 @@ class KritaiDocker(DockWidget):
         self._update_angle_tab_ui()
         return content
 
-    # ------------------------------------------------------------------
-    # Widget factory helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _make_slider_row(min_val: int, max_val: int, default: int, tooltip: str) -> tuple:
         """Create a slider+spinbox row. Returns (row_widget, slider, spinbox)."""
@@ -1742,10 +1581,6 @@ class KritaiDocker(DockWidget):
         )
         return row, seed, random_cb
 
-    # ------------------------------------------------------------------
-    # Tab-specific UI updates
-    # ------------------------------------------------------------------
-
     def _build_mask_tab(self) -> QWidget:
         content = QWidget()
         layout = QVBoxLayout(content)
@@ -1786,8 +1621,6 @@ class KritaiDocker(DockWidget):
     def _on_tab_changed(self, index: int) -> None:
         self._save_settings()
         self._update_generate_btn()
-        # Tell the parent layout that our preferred size has changed so it
-        # re-flows without stretching the tab widget to fill leftover space.
         self._tabs.updateGeometry()
 
     def _update_generate_tab_ui(self) -> None:
@@ -1820,10 +1653,6 @@ class KritaiDocker(DockWidget):
         if self._angle_guidance_label:
             self._angle_guidance_label.setVisible(is_base)
 
-    # ------------------------------------------------------------------
-    # Angle helpers
-    # ------------------------------------------------------------------
-
     def _build_angle_prompt(self) -> str:
         az_desc   = _snap_to_nearest_wrap(self._angle_azimuth.value(), AZIMUTH_MAP)
         el_desc   = _snap_to_nearest(self._angle_elevation.value(), ELEVATION_MAP)
@@ -1838,14 +1667,9 @@ class KritaiDocker(DockWidget):
         self._angle_elevation.setValue(elevation)
         self._angle_distance.setValue(distance)
 
-    # ------------------------------------------------------------------
-    # Settings persistence
-    # ------------------------------------------------------------------
-
     ANNOTATION_TYPE = "kritai_settings"
 
     def _connect_settings_signals(self) -> None:
-        # Generate tab signals.
         for signal in [
             self._gen_prompt.textChanged,
             self._gen_model.currentIndexChanged,
@@ -1859,7 +1683,6 @@ class KritaiDocker(DockWidget):
         ]:
             signal.connect(self._save_settings)
 
-        # Edit tab signals.
         for signal in [
             self._edit_prompt.textChanged,
             self._edit_quantize.currentIndexChanged,
@@ -1872,7 +1695,6 @@ class KritaiDocker(DockWidget):
         ]:
             signal.connect(self._save_settings)
 
-        # Angle tab signals.
         for signal in [
             self._angle_model.currentIndexChanged,
             self._angle_azimuth.valueChanged,
@@ -1887,14 +1709,12 @@ class KritaiDocker(DockWidget):
         ]:
             signal.connect(self._save_settings)
 
-        # Mask tab signals.
         for signal in [
             self._mask_model.currentIndexChanged,
             self._mask_alpha_matting.toggled,
         ]:
             signal.connect(self._save_settings)
 
-        # Auto-refresh triggers — text fields on focus-out, others immediately.
         gen_prompt_filter = _FocusOutSignal(self._gen_prompt)
         gen_prompt_filter.focusLost.connect(self._on_setting_changed)
 
@@ -1932,7 +1752,6 @@ class KritaiDocker(DockWidget):
         ]:
             signal.connect(self._on_setting_changed)
 
-        # Generate button update on prompt change.
         self._gen_prompt.textChanged.connect(self._update_generate_btn)
         self._edit_prompt.textChanged.connect(self._update_generate_btn)
 
@@ -2005,9 +1824,6 @@ class KritaiDocker(DockWidget):
         prev = self._doc_settings.get(uid)
         self._doc_settings[uid] = new
         if prev != new:
-            # Write annotation immediately so it's included in any subsequent
-            # Krita save — imageSaved fires *after* the file is written, so
-            # deferring to _flush_settings_to_doc would miss the current save.
             if doc.fileName():
                 raw = json.dumps(new).encode("utf-8")
                 doc.setAnnotation(self.ANNOTATION_TYPE, "Kritai settings", QByteArray(raw))
@@ -2019,7 +1835,6 @@ class KritaiDocker(DockWidget):
         if not filename:
             return
         uid = filename
-        # Migrate settings stored under the old id-based key (before first save).
         old_uid = str(id(doc))
         if old_uid != uid:
             self._migrate_uid(old_uid, uid)
@@ -2052,7 +1867,6 @@ class KritaiDocker(DockWidget):
         if uid in self._doc_settings:
             data = self._doc_settings[uid]
         else:
-            # First time seeing this doc this session — load from saved annotation.
             raw = doc.annotation(self.ANNOTATION_TYPE)
             if not raw:
                 return
@@ -2062,11 +1876,9 @@ class KritaiDocker(DockWidget):
                 return
             self._doc_settings[uid] = data
 
-        # Migrate old flat format.
         if "active_tab" not in data:
             data = self._migrate_old_settings(data, uid)
 
-        # Block signals while restoring.
         all_widgets = [
             self._gen_prompt, self._gen_model,
             self._gen_quantize, self._gen_steps, self._gen_guidance,
@@ -2086,7 +1898,6 @@ class KritaiDocker(DockWidget):
         for w in all_widgets:
             w.blockSignals(True)
 
-        # --- Restore Generate tab ---
         gen = data.get("generate", {})
         self._gen_prompt.setPlainText(gen.get("prompt", ""))
         idx = self._gen_model.findText(gen.get("model", "flux2-klein-4b"))
@@ -2104,7 +1915,6 @@ class KritaiDocker(DockWidget):
         self._gen_seed.setValue(gen.get("seed", 0))
         self._gen_random_seed.setChecked(gen.get("random_seed", False))
         self._gen_seed.setDisabled(self._gen_random_seed.isChecked())
-        # Restore generate LoRAs.
         for *_, row in list(self._gen_lora_entries):
             self._gen_lora_list.removeWidget(row)
             row.deleteLater()
@@ -2113,7 +1923,6 @@ class KritaiDocker(DockWidget):
             self._add_lora_row(self._gen_lora_entries, self._gen_lora_list,
                                lora.get("path", ""), lora.get("scale", 1.0), lora.get("enabled", True))
 
-        # --- Restore Edit tab ---
         edit = data.get("edit", {})
         idx = self._edit_model.findText(edit.get("model", "flux2-klein-base-4b"))
         if idx >= 0:
@@ -2131,7 +1940,6 @@ class KritaiDocker(DockWidget):
         self._edit_seed.setValue(edit.get("seed", 0))
         self._edit_random_seed.setChecked(edit.get("random_seed", False))
         self._edit_seed.setDisabled(self._edit_random_seed.isChecked())
-        # Restore edit reference images.
         for *_, row in list(self._edit_ref_entries):
             self._edit_ref_list.removeWidget(row)
             row.deleteLater()
@@ -2139,7 +1947,6 @@ class KritaiDocker(DockWidget):
         for ref in edit.get("reference_images", []):
             self._add_ref_row(self._edit_ref_entries, self._edit_ref_list,
                               ref.get("path", ""), ref.get("enabled", True))
-        # Restore edit LoRAs.
         for *_, row in list(self._edit_lora_entries):
             self._edit_lora_list.removeWidget(row)
             row.deleteLater()
@@ -2148,7 +1955,6 @@ class KritaiDocker(DockWidget):
             self._add_lora_row(self._edit_lora_entries, self._edit_lora_list,
                                lora.get("path", ""), lora.get("scale", 1.0), lora.get("enabled", True))
 
-        # --- Restore Angle tab ---
         angle = data.get("angle", {})
         idx = self._angle_model.findText(angle.get("model", "flux2-klein-4b"))
         if idx >= 0:
@@ -2175,22 +1981,18 @@ class KritaiDocker(DockWidget):
         self._angle_random_seed.setChecked(angle.get("random_seed", False))
         self._angle_seed.setDisabled(self._angle_random_seed.isChecked())
 
-        # --- Restore Mask tab ---
         mask = data.get("mask", {})
         midx = self._mask_model.findText(mask.get("model", MASK_MODELS[0]))
         if midx >= 0:
             self._mask_model.setCurrentIndex(midx)
         self._mask_alpha_matting.setChecked(mask.get("alpha_matting", False))
 
-        # --- Restore active tab ---
         self._tabs.setCurrentIndex(data.get("active_tab", 0))
 
-        # --- Restore upscale settings ---
         upscale = data.get("upscale")
         if upscale:
             self._upscale_settings[uid] = upscale
 
-        # --- Restore preview image if the temp file still exists ---
         preview_path = data.get("preview_path", "")
         if preview_path and os.path.exists(preview_path):
             self._job_for(uid).tmp_output = preview_path
@@ -2222,7 +2024,6 @@ class KritaiDocker(DockWidget):
         }
         if old_model in EDIT_MODELS:
             edit_data = {**common, "model": old_model}
-            # Migrate reference images.
             refs = data.get("reference_images", [])
             if not refs and data.get("reference_image"):
                 refs = [{"path": data["reference_image"], "prompt": "", "enabled": True}]
@@ -2235,10 +2036,6 @@ class KritaiDocker(DockWidget):
         migrated["preview_path"] = data.get("preview_path", "")
         self._doc_settings[uid] = migrated
         return migrated
-
-    # ------------------------------------------------------------------
-    # Auto-mode
-    # ------------------------------------------------------------------
 
     def _on_auto_toggled(self, checked: bool) -> None:
         if checked:
@@ -2305,19 +2102,12 @@ class KritaiDocker(DockWidget):
             self._last_canvas_hash = current
             self._debounce_timer.start()
 
-    # ------------------------------------------------------------------
-    # Generation
-    # ------------------------------------------------------------------
-
     def _sync_job_ui(self) -> None:
         """Point the shared progress widgets at the active document's job."""
         uid = self._current_uid()
         job = self._jobs.get(uid) if uid else None
         running = bool(job and job.running)
         showing = running or bool(job and job.status)
-        # An unknown percentage sits at zero rather than switching the bar to
-        # Qt's busy mode, which hides the text. The status carries the bytes
-        # received in that case, so the bar still shows it is alive.
         self._progress.setValue(max(0, job.progress) if job else 0)
         self._progress.setFormat(job.status if job else "")
         self._progress.setVisible(showing)
@@ -2384,19 +2174,15 @@ class KritaiDocker(DockWidget):
         if not is_mask and not prompt:
             return
 
-        # Make sure the CLI this action needs is installed before doing any work.
         if not self._ensure_dependency(DEP_REMBG if is_mask else DEP_MFLUX):
             return
 
         uid = self._doc_uid(doc)
         job = self._job_for(uid)
 
-        # Only replace this document's run — anything generating in another
-        # document keeps going.
         if job.thread:
             self._stop_thread(job.thread)
 
-        # Clean up this document's previous temp files
         for path in (job.tmp_input, job.tmp_output):
             if path and os.path.exists(path):
                 try:
@@ -2408,8 +2194,6 @@ class KritaiDocker(DockWidget):
         tmp_in.close()
         job.tmp_input = tmp_in.name
 
-        # Don't pre-create the output file — mflux won't overwrite an existing
-        # path. The counter keeps concurrent runs off each other's output.
         self._job_counter += 1
         job.tmp_output = os.path.join(
             tempfile.gettempdir(), f"kf_output_{os.getpid()}_{self._job_counter}.png"
@@ -2418,8 +2202,6 @@ class KritaiDocker(DockWidget):
         job.active_bounds = None
         job.ratio = None
         if is_mask:
-            # Honor an active selection: process only that region and remember
-            # where to drop the cutout back on import. No selection → whole canvas.
             sel = doc.selection()
             bounds = None
             if sel and sel.width() > 0 and sel.height() > 0:
@@ -2523,8 +2305,6 @@ class KritaiDocker(DockWidget):
         target_w = max(1, int(doc.width() * scale))
         target_h = max(1, int(doc.height() * scale))
 
-        # flux2-edit supports --width/--height but dimensions default to the first image
-        # when set to "auto". Pre-scale the canvas so the output matches the document size.
         if abs(scale - 1.0) >= 0.001:
             img = QImage(job.tmp_input)
             if not img.isNull():
@@ -2557,8 +2337,6 @@ class KritaiDocker(DockWidget):
         target_w = max(1, int(doc.width() * scale))
         target_h = max(1, int(doc.height() * scale))
 
-        # flux2-edit uses --image-paths and doesn't support --width/--height,
-        # so pre-scale the input image when needed.
         if abs(scale - 1.0) >= 0.001:
             img = QImage(job.tmp_input)
             if not img.isNull():
@@ -2594,8 +2372,6 @@ class KritaiDocker(DockWidget):
             f"File exists: {exists}, size: {size} bytes"
         )
         self._store_preview(job.uid, output_path)
-        # Remember where this result should land on import (a selection-scoped
-        # cutout goes back at its bounds; everything else is full-canvas).
         self._result_bounds[job.uid] = job.active_bounds
         elapsed = time.monotonic() - job.start_time
         minutes, seconds = divmod(int(elapsed), 60)
@@ -2606,8 +2382,6 @@ class KritaiDocker(DockWidget):
         job.status = "Error — see Logs."
         job.progress = 0
         self._sync_job_ui()
-        # Auto-expand the log panel on error so the user notices it — but only
-        # when the failing document is the one on screen.
         if job.uid == self._current_uid():
             self._log_btn.setChecked(True)
 
@@ -2632,8 +2406,6 @@ class KritaiDocker(DockWidget):
                 self._progress.setFormat("Downloading…")
 
     def _on_progress(self, job: _DocJob, value: int, status: str) -> None:
-        # A cancelled run can still have updates queued; taking them would put
-        # its progress bar back on screen after it was dismissed.
         if job.cancelled:
             return
         job.progress = value
@@ -2655,10 +2427,6 @@ class KritaiDocker(DockWidget):
         if job:
             job.log = ""
         self._log.clear()
-
-    # ------------------------------------------------------------------
-    # Preview
-    # ------------------------------------------------------------------
 
     def _store_preview(self, uid: str, path: str) -> None:
         """Keep the result for *uid*, showing it if that document is on screen."""
@@ -2721,7 +2489,6 @@ class KritaiDocker(DockWidget):
 
         job = self._jobs.get(uid)
 
-        # Determine scale from the active tab.
         tab = self._tabs.currentIndex()
         if tab == 0:
             scale = self._gen_scale.value() / 100
@@ -2740,14 +2507,12 @@ class KritaiDocker(DockWidget):
             and not job.running
         )
 
-        # Restore previous upscale settings for this document.
         saved = self._upscale_settings.get(uid, {})
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Import as Layer")
         layout = QVBoxLayout(dlg)
 
-        # --- Checkable upscale group ---
         upscale_group = QGroupBox("Upscale")
         upscale_group.setCheckable(True)
         upscale_group.setChecked(can_upscale)
@@ -2775,7 +2540,6 @@ class KritaiDocker(DockWidget):
         softness_row.setToolTip("0.0 = off, 1.0 = maximum softness.")
         upscale_form.addRow("Softness", softness_row)
 
-        # Use active tab's quantize as default.
         default_q = self._quantize_value(self._gen_quantize) if tab == 0 else (
             self._quantize_value(self._edit_quantize) if tab == 1 else self._quantize_value(self._angle_quantize)
         )
@@ -2800,7 +2564,6 @@ class KritaiDocker(DockWidget):
 
         layout.addWidget(upscale_group)
 
-        # --- Progress bar (hidden until upscale starts) ---
         dlg_progress = QProgressBar()
         dlg_progress.setRange(0, 100)
         dlg_progress.setValue(0)
@@ -2829,11 +2592,9 @@ class KritaiDocker(DockWidget):
                 dlg.accept()
                 return
 
-            # Upscaling shells out to mflux — make sure it's installed first.
             if not self._ensure_dependency(DEP_MFLUX):
                 return
 
-            # Disable controls and show progress.
             upscale_group.setEnabled(False)
             buttons.button(QDialogButtonBox.Ok).setEnabled(False)
             dlg_progress.setVisible(True)
@@ -2866,12 +2627,9 @@ class KritaiDocker(DockWidget):
             self._log_message("Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
 
             thread = GenerateThread(cmd, upscaled_path, verb="Upscaling")
-            # Keep a reference so it isn't garbage-collected.
             dlg._thread = thread
 
             def on_upscale_progress(value, status):
-                # Just the headline — the bar is one line wide, and the byte
-                # counts are in the log.
                 dlg_progress.setValue(max(0, value))
                 dlg_progress.setFormat(status)
 
@@ -2892,9 +2650,6 @@ class KritaiDocker(DockWidget):
                 dlg.accept()
 
             def on_error(msg):
-                # A failed upscale shouldn't cost the user the result: keep the
-                # dialog up with Upscale turned off, so Import brings the image
-                # in at the size it already has.
                 self._append_log(uid, msg)
                 upscale_group.setChecked(False)
                 upscale_group.setEnabled(False)
@@ -2962,8 +2717,7 @@ class KritaiDocker(DockWidget):
         uid = self._doc_uid(doc)
         bounds = self._result_bounds.get(uid)
         if bounds:
-            # Selection-scoped cutout: drop it back at its original position,
-            # native size, on an otherwise-transparent full-canvas layer.
+            # Dropped back at its original position, native size, on a transparent full-canvas layer.
             x, y, w, h = bounds
         else:
             x, y, w, h = 0, 0, doc.width(), doc.height()
@@ -2987,12 +2741,7 @@ class KritaiDocker(DockWidget):
 
         doc.refreshProjection()
 
-        # Stop auto mode now that the result is committed to the document.
         self._auto_btn.setChecked(False)
-
-    # ------------------------------------------------------------------
-    # LoRA / Reference helpers (parameterized)
-    # ------------------------------------------------------------------
 
     def _add_lora_row(self, entries_list: list, lora_layout: QVBoxLayout,
                       path: str = "", scale: float = 1.0, enabled: bool = True) -> None:
@@ -3134,28 +2883,21 @@ class KritaiDocker(DockWidget):
         row.deleteLater()
         self._update_generate_btn()
 
-    # ------------------------------------------------------------------
-
     def _update_preview_ratio(self, doc: object) -> None:
         if doc and doc.width() > 0:
             self._preview.setRatio(doc.height() / doc.width())
 
     def canvasChanged(self, canvas: object) -> None:
-        # Disable auto mode when switching documents.
         self._auto_btn.setChecked(False)
 
         from krita import Krita
         self._current_doc = Krita.instance().activeDocument() if canvas is not None else None
         if self._current_doc:
             self._load_settings(self._current_doc)
-        # Swap the shared preview, progress and log widgets over to the newly
-        # active document. Whatever the other documents are generating keeps
-        # running, and its progress is waiting when the user comes back.
         self._sync_preview()
         self._reload_log()
         self._sync_job_ui()
         self._update_generate_btn()
-
 
 def _export_selection_crop(doc: object, path: str) -> Optional[tuple[int, int, int, int]]:
     """Export the canvas region covered by the current selection to *path*.
