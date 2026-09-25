@@ -36,3 +36,13 @@ After running the script:
 3. Enable **Kritai**
 4. Restart Krita
 5. Open the docker via **Settings → Dockers → Kritai**
+
+## Development
+
+Linting and formatting run through [ruff](https://docs.astral.sh/ruff/) via `uv`, and CI checks both on every pull request.
+
+```bash
+uv sync
+uv run ruff check .
+uv run ruff format .
+```

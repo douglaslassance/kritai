@@ -1,4 +1,5 @@
 from krita import DockWidgetFactory, DockWidgetFactoryBase, Krita
+
 from .docker import KritaiDocker
 
 Krita.instance().addDockWidgetFactory(
