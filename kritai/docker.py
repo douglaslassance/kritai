@@ -12,15 +12,13 @@ import subprocess
 import tempfile
 import threading
 import time
-from typing import Optional
 
-from krita import DockWidget, InfoObject
+from krita import DockWidget, InfoObject, Krita
 from PyQt5.QtCore import (
     QByteArray,
     QEvent,
     QObject,
     QPointF,
-    QRectF,
     QSize,
     Qt,
     QThread,
@@ -37,17 +35,16 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QFrame,
     QGroupBox,
-    QScrollArea,
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSlider,
-    QSpacerItem,
     QSpinBox,
     QTabWidget,
     QToolButton,
@@ -57,14 +54,16 @@ from PyQt5.QtWidgets import (
 
 MFLUX_DIR = os.path.expanduser("~/.local/bin")
 
+# fmt: off
 MODEL_CLI = {
-    "flux2-klein-4b":      ("mflux-generate-flux2",      "flux2-klein-4b",      True,  False, False),
-    "flux2-klein-9b":      ("mflux-generate-flux2",      "flux2-klein-9b",      True,  False, False),
-    "flux2-klein-9b-kv":   ("mflux-generate-flux2",      "flux2-klein-9b-kv",   True,  False, False),
-    "flux2-klein-base-4b": ("mflux-generate-flux2",      "flux2-klein-base-4b", True,  True,  False),
-    "flux2-klein-base-9b": ("mflux-generate-flux2",      "flux2-klein-base-9b", True,  True,  False),
-    "flux2-edit":          ("mflux-generate-flux2-edit", None,                  False, True,  True),
+    "flux2-klein-4b":      ("mflux-generate-flux2", "flux2-klein-4b",      True,  False, False),
+    "flux2-klein-9b":      ("mflux-generate-flux2", "flux2-klein-9b",      True,  False, False),
+    "flux2-klein-9b-kv":   ("mflux-generate-flux2", "flux2-klein-9b-kv",   True,  False, False),
+    "flux2-klein-base-4b": ("mflux-generate-flux2", "flux2-klein-base-4b", True,  True,  False),
+    "flux2-klein-base-9b": ("mflux-generate-flux2", "flux2-klein-base-9b", True,  True,  False),
+    "flux2-edit":          ("mflux-generate-flux2-edit", None,            False, True,  True),
 }
+# fmt: on
 
 GENERATE_MODELS = ["flux2-klein-4b", "flux2-klein-9b", "flux2-klein-base-4b", "flux2-klein-base-9b"]
 EDIT_MODELS = ["flux2-edit"]
@@ -79,14 +78,17 @@ ANGLE_MODELS = [
 ]
 
 # Krita Finder-launched PATH often omits where uv and Homebrew drop binaries.
+# fmt: off
 _TOOL_SEARCH_DIRS = [
     MFLUX_DIR,                              # uv tool install / pipx default
     "/opt/homebrew/bin",                   # Homebrew on Apple Silicon
     "/usr/local/bin",                      # Homebrew on Intel
     os.path.expanduser("~/.cargo/bin"),
 ]
+# fmt: on
 
-def find_executable(name: str) -> Optional[str]:
+
+def find_executable(name: str) -> str | None:
     """Full path to *name* if it's installed, else ``None``.
 
     Checks PATH first, then the common install dirs above, since Krita launched
@@ -101,6 +103,7 @@ def find_executable(name: str) -> Optional[str]:
             return candidate
     return None
 
+
 REMBG_CLI = "rembg"
 
 MASK_MODELS = [
@@ -109,6 +112,7 @@ MASK_MODELS = [
     "u2net",
 ]
 
+# fmt: off
 AZIMUTH_MAP = [
     (0,    "front view"),
     (45,   "front-left quarter view"),
@@ -140,9 +144,11 @@ ANGLE_PRESETS = {
     "Top":    (0,    90,  100),
     "Bottom": (0,    -90, 100),
 }
+# fmt: on
 
 POLL_INTERVAL_MS = 1500
 DEBOUNCE_MS = 2000
+
 
 class PreviewLabel(QLabel):
     """QLabel that paints its pixmap centered with correct aspect ratio."""
@@ -150,7 +156,7 @@ class PreviewLabel(QLabel):
     def __init__(self) -> None:
         super().__init__()
         self._ratio: float = 1.0
-        self._source: Optional[QPixmap] = None
+        self._source: QPixmap | None = None
         self._height_update_pending: bool = False
 
     def clearPixmap(self) -> None:
@@ -203,12 +209,14 @@ class PreviewLabel(QLabel):
 
     def paintEvent(self, event: QEvent) -> None:
         from PyQt5.QtGui import QPainter
+
         painter = QPainter(self)
         if self._source:
             scaled = self._source.scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             x = (self.width() - scaled.width()) // 2
             y = (self.height() - scaled.height()) // 2
             painter.drawPixmap(x, y, scaled)
+
 
 class _AdaptiveTabWidget(QTabWidget):
     """QTabWidget whose size hint tracks the active tab only.
@@ -229,42 +237,43 @@ class _AdaptiveTabWidget(QTabWidget):
         if w is None:
             return super().sizeHint() if preferred else super().minimumSizeHint()
         content = w.sizeHint() if preferred else w.minimumSizeHint()
-        tab_bar  = self.tabBar()
-        margins  = self.contentsMargins()
-        w_extra  = margins.left() + margins.right()
-        h_extra  = tab_bar.sizeHint().height() + margins.top() + margins.bottom() + 4
+        tab_bar = self.tabBar()
+        margins = self.contentsMargins()
+        w_extra = margins.left() + margins.right()
+        h_extra = tab_bar.sizeHint().height() + margins.top() + margins.bottom() + 4
         min_tab_w = tab_bar.minimumSizeHint().width()
         return QSize(
             max(content.width() + w_extra, min_tab_w),
             max(content.height() + h_extra, tab_bar.sizeHint().height() + 20),
         )
 
+
 class CameraOrbitWidget(QWidget):
     """Interactive 3D orbit widget: drag the teal dot to rotate azimuth,
     the magenta dot (camera) to change elevation, the amber dot to zoom."""
 
-    azimuth_changed   = pyqtSignal(int)   # –180 – 180
-    elevation_changed = pyqtSignal(int)   # –90 – 90
-    distance_changed  = pyqtSignal(int)   # 60 – 180
+    azimuth_changed = pyqtSignal(int)  # –180 – 180
+    elevation_changed = pyqtSignal(int)  # –90 – 90
+    distance_changed = pyqtSignal(int)  # 60 – 180
 
-    _VY = math.radians(30)   # scene yaw  (rotate world around Y before projecting)
-    _VP = math.radians(25)   # view pitch (tilt camera down)
+    _VY = math.radians(30)  # scene yaw  (rotate world around Y before projecting)
+    _VP = math.radians(25)  # view pitch (tilt camera down)
 
-    _R_GRID    = 1.4   # fixed grid radius — independent of camera distance
+    _R_GRID = 1.4  # fixed grid radius — independent of camera distance
 
-    _R_HANDLE  = 5    # handle draw radius px
-    _R_HIT     = 14   # click hit radius px
+    _R_HANDLE = 5  # handle draw radius px
+    _R_HIT = 14  # click hit radius px
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._az    = 0
-        self._el    = 0
-        self._dist  = 100        # range 60–180
-        self._drag           = False
-        self._drag_origin    = None
-        self._drag_start_az  = 0
-        self._drag_start_el  = 0
-        self._hovered        = False
+        self._az = 0
+        self._el = 0
+        self._dist = 100  # range 60–180
+        self._drag = False
+        self._drag_origin = None
+        self._drag_start_az = 0
+        self._drag_start_el = 0
+        self._hovered = False
         self.setFixedWidth(160)
         self.setMinimumHeight(80)
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
@@ -288,9 +297,14 @@ class CameraOrbitWidget(QWidget):
             self._dist = v
             self.update()
 
-    def azimuth(self)  -> int: return self._az
-    def elevation(self) -> int: return self._el
-    def distance(self)  -> int: return self._dist
+    def azimuth(self) -> int:
+        return self._az
+
+    def elevation(self) -> int:
+        return self._el
+
+    def distance(self) -> int:
+        return self._dist
 
     def _scale(self) -> float:
         return min(self.width(), self.height()) * 0.35
@@ -300,7 +314,7 @@ class CameraOrbitWidget(QWidget):
 
     def _project(self, x: float, y: float, z: float) -> QPointF:
         vy, vp = self._VY, self._VP
-        rx =  x * math.cos(vy) + z * math.sin(vy)
+        rx = x * math.cos(vy) + z * math.sin(vy)
         rz = -x * math.sin(vy) + z * math.cos(vy)
         sx = rx
         sy = -y * math.cos(vp) + rz * math.sin(vp)
@@ -309,15 +323,16 @@ class CameraOrbitWidget(QWidget):
         return QPointF(o.x() + sx * s, o.y() + sy * s)
 
     def _cam_xyz(self, az=None, el=None, dist=None):
-        if az   is None: az   = self._az
-        if el   is None: el   = self._el
-        if dist is None: dist = self._dist
+        if az is None:
+            az = self._az
+        if el is None:
+            el = self._el
+        if dist is None:
+            dist = self._dist
         a = math.radians(az)
         e = math.radians(el)
         r = dist / 100.0
-        return (r * math.cos(e) * math.sin(a),
-                r * math.sin(e),
-                r * math.cos(e) * math.cos(a))
+        return (r * math.cos(e) * math.sin(a), r * math.sin(e), r * math.cos(e) * math.cos(a))
 
     def _screen_depth(self, x, y, z) -> float:
         """Negative = in front of viewer (use to decide front vs back)."""
@@ -331,10 +346,11 @@ class CameraOrbitWidget(QWidget):
     def _palette_colors(self):
         """Return (bg, grid, ring, arc) derived from the live Qt palette."""
         from PyQt5.QtWidgets import QApplication
-        pal     = QApplication.palette()
-        bg      = pal.color(pal.Window).darker(150)
-        accent  = pal.color(pal.Highlight)
-        grid_c  = QColor(pal.color(pal.Midlight))
+
+        pal = QApplication.palette()
+        bg = pal.color(pal.Window).darker(150)
+        accent = pal.color(pal.Highlight)
+        grid_c = QColor(pal.color(pal.Midlight))
         grid_c.setAlpha(160)
         return bg, grid_c, accent
 
@@ -355,8 +371,8 @@ class CameraOrbitWidget(QWidget):
         n = 5
         for i in range(-n, n + 1):
             t = i * r / n
-            p.drawLine(self._project(-r, y, t), self._project(r,  y, t))
-            p.drawLine(self._project(t,  y, -r), self._project(t, y, r))
+            p.drawLine(self._project(-r, y, t), self._project(r, y, t))
+            p.drawLine(self._project(t, y, -r), self._project(t, y, r))
 
     def _fog_alpha(self, depth: float, r: float) -> int:
         """Map screen depth → alpha: front (+r) = 255, back (–r) = 35."""
@@ -367,31 +383,35 @@ class CameraOrbitWidget(QWidget):
         r = self._dist / 100.0
         steps = 80
         for i in range(steps):
-            a1 = 2 * math.pi * i       / steps
+            a1 = 2 * math.pi * i / steps
             a2 = 2 * math.pi * (i + 1) / steps
             x1, z1 = r * math.sin(a1), r * math.cos(a1)
             x2, z2 = r * math.sin(a2), r * math.cos(a2)
-            depth  = (self._screen_depth(x1, 0, z1) + self._screen_depth(x2, 0, z2)) * 0.5
-            col    = QColor(base)
+            depth = (self._screen_depth(x1, 0, z1) + self._screen_depth(x2, 0, z2)) * 0.5
+            col = QColor(base)
             col.setAlpha(self._fog_alpha(depth, r))
             p.setPen(QPen(col, 1.5))
             p.drawLine(self._project(x1, 0, z1), self._project(x2, 0, z2))
 
     def _draw_elevation_arc(self, p: QPainter, base: QColor) -> None:
-        r  = self._dist / 100.0
-        a  = math.radians(self._az)
+        r = self._dist / 100.0
+        a = math.radians(self._az)
         steps = 40
         for i in range(steps):
-            e1 = math.pi * i       / steps - math.pi / 2
+            e1 = math.pi * i / steps - math.pi / 2
             e2 = math.pi * (i + 1) / steps - math.pi / 2
+
             def pt(e):
-                return (r * math.cos(e) * math.sin(a),
-                        r * math.sin(e),
-                        r * math.cos(e) * math.cos(a))
+                return (
+                    r * math.cos(e) * math.sin(a),
+                    r * math.sin(e),
+                    r * math.cos(e) * math.cos(a),
+                )
+
             x1, y1, z1 = pt(e1)
             x2, y2, z2 = pt(e2)
-            depth  = (self._screen_depth(x1, y1, z1) + self._screen_depth(x2, y2, z2)) * 0.5
-            col    = QColor(base)
+            depth = (self._screen_depth(x1, y1, z1) + self._screen_depth(x2, y2, z2)) * 0.5
+            col = QColor(base)
             col.setAlpha(self._fog_alpha(depth, r))
             p.setPen(QPen(col, 1.5))
             p.drawLine(self._project(x1, y1, z1), self._project(x2, y2, z2))
@@ -400,6 +420,7 @@ class CameraOrbitWidget(QWidget):
         r = float(self._R_HANDLE)
         if self._hovered or self._drag:
             from PyQt5.QtWidgets import QApplication
+
             text_c = QApplication.palette().color(QApplication.palette().WindowText)
             p.setPen(QPen(text_c, 1.5))
         else:
@@ -418,21 +439,21 @@ class CameraOrbitWidget(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() != Qt.LeftButton:
             return
-        self._drag           = 'free'
-        self._drag_origin    = QPointF(event.pos())
-        self._drag_start_az  = self._az
-        self._drag_start_el  = self._el
+        self._drag = "free"
+        self._drag_origin = QPointF(event.pos())
+        self._drag_start_az = self._az
+        self._drag_start_el = self._el
         self.setCursor(Qt.ClosedHandCursor)
 
     def mouseMoveEvent(self, event) -> None:
         if not self._drag:
             return
         pos = QPointF(event.pos())
-        dx  = pos.x() - self._drag_origin.x()
-        dy  = pos.y() - self._drag_origin.y()
+        dx = pos.x() - self._drag_origin.x()
+        dy = pos.y() - self._drag_origin.y()
 
         new_az = max(-180, min(180, int(round(self._drag_start_az + dx))))
-        new_el = max(-90,  min(90,  int(round(self._drag_start_el - dy * 0.8))))
+        new_el = max(-90, min(90, int(round(self._drag_start_el - dy * 0.8))))
         changed = False
         if self._az != new_az:
             self._az = new_az
@@ -449,6 +470,7 @@ class CameraOrbitWidget(QWidget):
         if event.button() == Qt.LeftButton:
             self._drag = None
             self.setCursor(Qt.ArrowCursor)
+
 
 class DropThumbnail(QLabel):
     """64x64 label that accepts image drops and clicks to browse."""
@@ -493,9 +515,9 @@ class DropThumbnail(QLabel):
 
     def mousePressEvent(self, event: QEvent) -> None:
         from PyQt5.QtWidgets import QFileDialog
+
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select reference image", "",
-            "Images (*.png *.jpg *.jpeg *.webp *.tiff)"
+            self, "Select reference image", "", "Images (*.png *.jpg *.jpeg *.webp *.tiff)"
         )
         if path:
             self.setImagePath(path)
@@ -523,10 +545,11 @@ class DropThumbnail(QLabel):
                 self.setImagePath(path)
                 return
 
+
 class CollapsibleSection(QWidget):
     """A full-width accordion-style collapsible section."""
 
-    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._title = title
 
@@ -567,14 +590,15 @@ class CollapsibleSection(QWidget):
         self._content.setVisible(checked)
         self._toggle.setText(("▼" if checked else "▶") + f"  {self._title}")
 
+
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 _TQDM_RE = re.compile(
     r"^(?P<desc>.*?):?\s*"
     r"(?:(?P<pct>\d{1,3})%)?\s*"
-    r"\|[^|]*?\|?\s*"                                  # the bar, one or both pipes
+    r"\|[^|]*?\|?\s*"  # the bar, one or both pipes
     r"(?P<n>[\d.]+\s?[A-Za-z]*)"
-    r"(?:\s*/\s*(?P<total>[\d.]+\s?[A-Za-z]*))?"       # total, when the bar has one
+    r"(?:\s*/\s*(?P<total>[\d.]+\s?[A-Za-z]*))?"  # total, when the bar has one
     r"(?P<tail>(?:\s*\[[^\]]*\])?(?:\s*,[^,\[\]]*)*)"
 )
 _TQDM_NOBAR_RE = re.compile(
@@ -587,8 +611,10 @@ _DOWNLOAD_WORDS = ("download", "reconstruct", "fetching")
 
 PCT_UNKNOWN = -1
 
-def _match_bar(line: str) -> Optional[re.Match]:
+
+def _match_bar(line: str) -> re.Match | None:
     return _TQDM_RE.match(line) or _TQDM_NOBAR_RE.match(line)
+
 
 class _ProgressParser:
     """Turns tqdm bars on stderr into (percent, status) updates.
@@ -604,13 +630,13 @@ class _ProgressParser:
     def __init__(self, verb: str = "Generating") -> None:
         self.verb = verb
         self._pct = PCT_UNKNOWN
-        self._moved = ""        # bytes off the wire, when no bar knows a total
+        self._moved = ""  # bytes off the wire, when no bar knows a total
         self._has_total = False
 
     def _reset(self) -> None:
         self.__init__(self.verb)
 
-    def feed(self, m: re.Match) -> Optional[tuple[int, str]]:
+    def feed(self, m: re.Match) -> tuple[int, str] | None:
         """Fold a matched tqdm bar into the picture and report it."""
         raw_pct = m.group("pct")
         pct = min(100, int(raw_pct)) if raw_pct else PCT_UNKNOWN
@@ -644,18 +670,19 @@ class _ProgressParser:
             return self._pct, f"Downloading… {self._moved}"
         return self._pct, "Downloading…"
 
+
 class GenerateThread(QThread):
-    finished = pyqtSignal(str)          # output path
-    errored = pyqtSignal(str)           # error message
-    logged = pyqtSignal(str)            # line of stdout/stderr for the log panel
-    progress = pyqtSignal(int, str)     # 0–100 (or PCT_UNKNOWN), status line
+    finished = pyqtSignal(str)  # output path
+    errored = pyqtSignal(str)  # error message
+    logged = pyqtSignal(str)  # line of stdout/stderr for the log panel
+    progress = pyqtSignal(int, str)  # 0–100 (or PCT_UNKNOWN), status line
 
     def __init__(self, cmd: list[str], output_path: str, verb: str = "Generating") -> None:
         super().__init__()
         self.cmd = cmd
         self.output_path = output_path
         self.verb = verb
-        self._proc: Optional[subprocess.Popen] = None
+        self._proc: subprocess.Popen | None = None
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -687,7 +714,8 @@ class GenerateThread(QThread):
     def run(self) -> None:
         try:
             clean_env = {
-                k: v for k, v in os.environ.items()
+                k: v
+                for k, v in os.environ.items()
                 if k not in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE")
             }
             clean_env["TQDM_POSITION"] = "-1"
@@ -716,7 +744,7 @@ class GenerateThread(QThread):
                         if update is not None:
                             self.progress.emit(*update)
                         if (m.group("pct") or "") not in ("0", "100"):
-                            rest = line[m.end():].strip()
+                            rest = line[m.end() :].strip()
                             if not rest:
                                 continue
                             line = rest
@@ -746,17 +774,26 @@ class GenerateThread(QThread):
             self.logged.emit(str(e))
             self.errored.emit(str(e))
 
+
 class _Dependency:
     """A CLI tool Kritai shells out to, plus how to install it."""
 
-    def __init__(self, label: str, package: str, executables: list[str],
-                 docs_url: str, reason: str, install_args: list[str] = None) -> None:
-        self.label = label              # human name, e.g. "mflux"
-        self.package = package          # uv package spec, e.g. "rembg[cli]"
+    def __init__(
+        self,
+        label: str,
+        package: str,
+        executables: list[str],
+        docs_url: str,
+        reason: str,
+        install_args: list[str] = None,
+    ) -> None:
+        self.label = label  # human name, e.g. "mflux"
+        self.package = package  # uv package spec, e.g. "rembg[cli]"
         self.executables = executables  # CLI names that must exist once installed
         self.docs_url = docs_url
-        self.reason = reason            # one-line "why it's needed"
+        self.reason = reason  # one-line "why it's needed"
         self.install_args = install_args or []  # extra flags for `uv tool install`
+
 
 DEP_MFLUX = _Dependency(
     "mflux",
@@ -775,12 +812,13 @@ DEP_REMBG = _Dependency(
     install_args=["--with", "numba>=0.60"],
 )
 
+
 class InstallThread(QThread):
     """Runs a sequence of shell commands, streaming output; stops on first failure."""
 
     logged = pyqtSignal(str)
     progress = pyqtSignal(int)
-    done = pyqtSignal(bool)           # True if every command succeeded
+    done = pyqtSignal(bool)  # True if every command succeeded
 
     def __init__(self, commands: list[list[str]]) -> None:
         super().__init__()
@@ -788,15 +826,19 @@ class InstallThread(QThread):
 
     def run(self) -> None:
         clean_env = {
-            k: v for k, v in os.environ.items()
+            k: v
+            for k, v in os.environ.items()
             if k not in ("PYTHONHOME", "PYTHONPATH", "PYTHONEXECUTABLE")
         }
         for cmd in self.commands:
             self.logged.emit("$ " + " ".join(cmd))
             try:
                 proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, env=clean_env,
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=clean_env,
                 )
             except OSError as e:
                 self.logged.emit(str(e))
@@ -813,6 +855,7 @@ class InstallThread(QThread):
                 return
         self.done.emit(True)
 
+
 class DependencyDialog(QDialog):
     """Explains a missing CLI dependency and offers a one-click install.
 
@@ -826,7 +869,7 @@ class DependencyDialog(QDialog):
         self._dep = dep
         self._log_fn = log_fn or (lambda _s: None)
         self.installed = False
-        self._thread: Optional[InstallThread] = None
+        self._thread: InstallThread | None = None
 
         self.setWindowTitle(f"{dep.label} required")
         layout = QVBoxLayout(self)
@@ -906,6 +949,7 @@ class DependencyDialog(QDialog):
 
     def _copy(self) -> None:
         from PyQt5.QtWidgets import QApplication
+
         QApplication.clipboard().setText(self._cmd_text)
 
     def _start_install(self) -> None:
@@ -934,12 +978,13 @@ class DependencyDialog(QDialog):
             self._progress.setVisible(False)
             self._install_btn.setEnabled(True)
             self._on_log(
-                "Installation did not complete — see the log above, or run the "
-                "command manually."
+                "Installation did not complete — see the log above, or run the command manually."
             )
+
 
 class _FocusOutSignal(QObject):
     """Emits focusLost when the watched widget loses focus."""
+
     focusLost = pyqtSignal()
 
     def __init__(self, widget: QWidget) -> None:
@@ -951,15 +996,20 @@ class _FocusOutSignal(QObject):
             self.focusLost.emit()
         return False
 
+
 def _snap_to_nearest(value: int, mapping: list[tuple[int, str]]) -> str:
     """Return the description for the nearest key in *mapping*."""
     return min(mapping, key=lambda kv: abs(value - kv[0]))[1]
 
+
 def _snap_to_nearest_wrap(value: int, mapping: list[tuple[int, str]], wrap: int = 360) -> str:
     """Return the description for the nearest key, wrapping around *wrap*."""
+
     def dist(kv):
         return min(abs(value - kv[0]), wrap - abs(value - kv[0]))
+
     return min(mapping, key=dist)[1]
+
 
 class _DocJob:
     """Generation state for a single document.
@@ -972,35 +1022,35 @@ class _DocJob:
 
     def __init__(self, uid: str) -> None:
         self.uid = uid
-        self.thread: Optional[GenerateThread] = None
-        self.tmp_input: Optional[str] = None
-        self.tmp_output: Optional[str] = None
+        self.thread: GenerateThread | None = None
+        self.tmp_input: str | None = None
+        self.tmp_output: str | None = None
         self.start_time: float = 0.0
         self.progress: int = 0
         self.status: str = ""
         self.elapsed: str = ""
         self.cancelled: bool = False
         self.log: str = ""
-        self.active_bounds: Optional[tuple] = None
-        self.ratio: Optional[float] = None
+        self.active_bounds: tuple | None = None
+        self.ratio: float | None = None
 
     @property
     def running(self) -> bool:
         return bool(self.thread and self.thread.isRunning())
 
-class KritaiDocker(DockWidget):
 
+class KritaiDocker(DockWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Kritai")
-        self._last_canvas_hash: Optional[str] = None
+        self._last_canvas_hash: str | None = None
         self._current_doc = None  # krita.Document
         self._doc_previews: dict[str, QPixmap] = {}
         self._doc_settings: dict[str, dict] = {}
         self._upscale_settings: dict[str, dict] = {}
         self._jobs: dict[str, _DocJob] = {}
         self._job_counter = 0
-        self._result_bounds: dict[str, Optional[tuple]] = {}
+        self._result_bounds: dict[str, tuple | None] = {}
 
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
         Krita.instance().notifier().applicationClosing.connect(self._on_application_closing)
@@ -1022,7 +1072,7 @@ class KritaiDocker(DockWidget):
         """Key a document by file name, falling back to identity if unsaved."""
         return doc.fileName() or str(id(doc))
 
-    def _current_uid(self) -> Optional[str]:
+    def _current_uid(self) -> str | None:
         return self._doc_uid(self._current_doc) if self._current_doc else None
 
     def _job_for(self, uid: str) -> _DocJob:
@@ -1034,8 +1084,13 @@ class KritaiDocker(DockWidget):
 
     def _migrate_uid(self, old_uid: str, new_uid: str) -> None:
         """Move per-document state after a first save changes the document key."""
-        for store in (self._doc_settings, self._doc_previews,
-                      self._upscale_settings, self._result_bounds, self._jobs):
+        for store in (
+            self._doc_settings,
+            self._doc_previews,
+            self._upscale_settings,
+            self._result_bounds,
+            self._jobs,
+        ):
             if old_uid in store:
                 store[new_uid] = store.pop(old_uid)
         job = self._jobs.get(new_uid)
@@ -1062,23 +1117,35 @@ class KritaiDocker(DockWidget):
         self._tabs.addTab(self._build_edit_tab(), "Edit")
         self._tabs.addTab(self._build_angle_tab(), "Frame")
         self._tabs.addTab(self._build_mask_tab(), "Mask")
-        self._tabs.setTabToolTip(0, (
-            "Generates a new image from your prompt, using the current canvas "
-            "as the starting point."
-        ))
-        self._tabs.setTabToolTip(1, (
-            "Edits the current canvas or selection following your prompt. "
-            "Optionally add reference images to steer the result."
-        ))
-        self._tabs.setTabToolTip(2, (
-            "Re-renders the subject from a new camera angle while keeping its "
-            "style, lighting, and background."
-        ))
-        self._tabs.setTabToolTip(3, (
-            "Removes the background from the current canvas or selection and "
-            "previews the result as a transparent image, ready to import as a "
-            "new layer. Model weights download on first use."
-        ))
+        self._tabs.setTabToolTip(
+            0,
+            (
+                "Generates a new image from your prompt, using the current canvas "
+                "as the starting point."
+            ),
+        )
+        self._tabs.setTabToolTip(
+            1,
+            (
+                "Edits the current canvas or selection following your prompt. "
+                "Optionally add reference images to steer the result."
+            ),
+        )
+        self._tabs.setTabToolTip(
+            2,
+            (
+                "Re-renders the subject from a new camera angle while keeping its "
+                "style, lighting, and background."
+            ),
+        )
+        self._tabs.setTabToolTip(
+            3,
+            (
+                "Removes the background from the current canvas or selection and "
+                "previews the result as a transparent image, ready to import as a "
+                "new layer. Model weights download on first use."
+            ),
+        )
         self._tabs.currentChanged.connect(self._on_tab_changed)
         outer.addWidget(self._tabs)
 
@@ -1087,7 +1154,9 @@ class KritaiDocker(DockWidget):
 
         self._auto_btn = QToolButton()
         self._auto_btn.setCheckable(True)
-        self._auto_btn.setToolTip("Live refresh — regenerate automatically whenever the canvas or a setting changes")
+        self._auto_btn.setToolTip(
+            "Live refresh — regenerate automatically whenever the canvas or a setting changes"
+        )
         self._auto_btn.setIcon(Krita.instance().icon("reload-preset"))
         self._auto_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._auto_btn.toggled.connect(self._on_auto_toggled)
@@ -1193,10 +1262,18 @@ class KritaiDocker(DockWidget):
 
         self._gen_model = QComboBox()
         model_tooltips = {
-            "flux2-klein-4b":      "Fast distilled 4B model. Good default for quick iterations. No guidance.",
-            "flux2-klein-9b":      "Distilled 9B model. Higher quality than 4B but slower. No guidance.",
-            "flux2-klein-base-4b": "Non-distilled 4B base model. Supports guidance. Needs more steps.",
-            "flux2-klein-base-9b": "Non-distilled 9B base model. Best quality in the FLUX.2 family.",
+            "flux2-klein-4b": (
+                "Fast distilled 4B model. Good default for quick iterations. No guidance."
+            ),
+            "flux2-klein-9b": (
+                "Distilled 9B model. Higher quality than 4B but slower. No guidance."
+            ),
+            "flux2-klein-base-4b": (
+                "Non-distilled 4B base model. Supports guidance. Needs more steps."
+            ),
+            "flux2-klein-base-9b": (
+                "Non-distilled 9B base model. Best quality in the FLUX.2 family."
+            ),
         }
         for m in GENERATE_MODELS:
             self._gen_model.addItem(m)
@@ -1245,19 +1322,25 @@ class KritaiDocker(DockWidget):
         self._gen_guidance_label = form.labelForField(self._gen_guidance)
 
         strength_row, self._gen_strength, self._gen_strength_spin = self._make_slider_row(
-            0, 100, 75, "How much the canvas influences the result.\n"
+            0,
+            100,
+            75,
+            "How much the canvas influences the result.\n"
             "0.0 = output ignores your painting entirely.\n"
             "1.0 = output stays very close to the canvas.\n"
-            "0.5–0.7 is a good starting range."
+            "0.5–0.7 is a good starting range.",
         )
         form.addRow("Strength", strength_row)
         self._gen_strength_row = strength_row
         self._gen_strength_label = form.labelForField(strength_row)
 
         scale_row, self._gen_scale, self._gen_scale_spin = self._make_slider_row(
-            0, 100, 50, "Scale of the canvas sent to mflux relative to its original size.\n"
+            0,
+            100,
+            50,
+            "Scale of the canvas sent to mflux relative to its original size.\n"
             "0.5 = half resolution (faster, less VRAM).\n"
-            "1.0 = full resolution."
+            "1.0 = full resolution.",
         )
         form.addRow("Scale", scale_row)
 
@@ -1278,7 +1361,9 @@ class KritaiDocker(DockWidget):
         add_lora_btn = QToolButton()
         add_lora_btn.setIcon(Krita.instance().icon("list-add"))
         add_lora_btn.setToolTip("Add LoRA")
-        add_lora_btn.clicked.connect(lambda: self._add_lora_row(self._gen_lora_entries, self._gen_lora_list))
+        add_lora_btn.clicked.connect(
+            lambda: self._add_lora_row(self._gen_lora_entries, self._gen_lora_list)
+        )
         gen_lora_content.addWidget(add_lora_btn)
         gen_lora_section.setContentLayout(gen_lora_content)
         layout.addWidget(gen_lora_section)
@@ -1307,10 +1392,10 @@ class KritaiDocker(DockWidget):
 
         self._edit_model = QComboBox()
         edit_model_tooltips = {
-            "flux2-klein-4b":      "Distilled 4B model. Fast, no guidance.",
-            "flux2-klein-9b":      "Distilled 9B model. Higher quality, no guidance.",
-            "flux2-klein-9b-kv":   "Distilled 9B model with a KV cache. Same quality as 9B and\n"
-                                   "roughly 2.4x faster once reference images are attached. No guidance.",
+            "flux2-klein-4b": "Distilled 4B model. Fast, no guidance.",
+            "flux2-klein-9b": "Distilled 9B model. Higher quality, no guidance.",
+            "flux2-klein-9b-kv": "Distilled 9B model with a KV cache. Same quality as 9B and\n"
+            "roughly 2.4x faster once reference images are attached. No guidance.",
             "flux2-klein-base-4b": "Base 4B model. Slower, supports guidance.",
             "flux2-klein-base-9b": "Base 9B model. Best quality, supports guidance.",
         }
@@ -1368,7 +1453,9 @@ class KritaiDocker(DockWidget):
         add_ref_btn = QToolButton()
         add_ref_btn.setIcon(Krita.instance().icon("list-add"))
         add_ref_btn.setToolTip("Add reference image")
-        add_ref_btn.clicked.connect(lambda: self._add_ref_row(self._edit_ref_entries, self._edit_ref_list))
+        add_ref_btn.clicked.connect(
+            lambda: self._add_ref_row(self._edit_ref_entries, self._edit_ref_list)
+        )
         ref_content.addWidget(add_ref_btn)
         self._edit_ref_section.setContentLayout(ref_content)
         self._edit_ref_section.setVisible(False)
@@ -1385,7 +1472,9 @@ class KritaiDocker(DockWidget):
         add_lora_btn = QToolButton()
         add_lora_btn.setIcon(Krita.instance().icon("list-add"))
         add_lora_btn.setToolTip("Add LoRA")
-        add_lora_btn.clicked.connect(lambda: self._add_lora_row(self._edit_lora_entries, self._edit_lora_list))
+        add_lora_btn.clicked.connect(
+            lambda: self._add_lora_row(self._edit_lora_entries, self._edit_lora_list)
+        )
         edit_lora_content.addWidget(add_lora_btn)
         edit_lora_section.setContentLayout(edit_lora_content)
         layout.addWidget(edit_lora_section)
@@ -1419,7 +1508,7 @@ class KritaiDocker(DockWidget):
             row = QWidget()
             # Expanding is required for AllNonFixedFieldsGrow to stretch the row on macOS.
             row.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-            hl  = QHBoxLayout(row)
+            hl = QHBoxLayout(row)
             hl.setContentsMargins(0, 0, 0, 0)
             hl.setSpacing(4)
             slider = QSlider(Qt.Horizontal)
@@ -1439,19 +1528,22 @@ class KritaiDocker(DockWidget):
             return row, slider, spin
 
         az_row, self._angle_azimuth, self._angle_azimuth_spin = _int_slider_row(
-            -180, 180, 0, "°", "Horizontal rotation around the subject (0° = front).")
+            -180, 180, 0, "°", "Horizontal rotation around the subject (0° = front)."
+        )
         self._angle_azimuth.valueChanged.connect(self._orbit.setAzimuth)
         self._orbit.azimuth_changed.connect(self._angle_azimuth.setValue)
         cam_form.addRow("Azimuth", az_row)
 
         el_row, self._angle_elevation, self._angle_elevation_spin = _int_slider_row(
-            -90, 90, 0, "°", "Vertical angle (−90° = bottom, 0° = eye-level, 90° = top).")
+            -90, 90, 0, "°", "Vertical angle (−90° = bottom, 0° = eye-level, 90° = top)."
+        )
         self._angle_elevation.valueChanged.connect(self._orbit.setElevation)
         self._orbit.elevation_changed.connect(self._angle_elevation.setValue)
         cam_form.addRow("Elevation", el_row)
 
         dist_row, self._angle_distance, self._angle_distance_spin = _int_slider_row(
-            60, 180, 100, "", "Camera distance (60 = close-up, 100 = medium, 180 = wide).")
+            60, 180, 100, "", "Camera distance (60 = close-up, 100 = medium, 180 = wide)."
+        )
         self._angle_distance.valueChanged.connect(self._orbit.setDistance)
         self._orbit.distance_changed.connect(self._angle_distance.setValue)
         cam_form.addRow("Distance", dist_row)
@@ -1478,7 +1570,9 @@ class KritaiDocker(DockWidget):
         for name, (az, el, dist) in ANGLE_PRESETS.items():
             btn = QPushButton(name)
             btn.setToolTip(f"Azimuth {az}°, Elevation {el}°, Distance {dist}")
-            btn.clicked.connect(lambda checked=False, a=az, e=el, d=dist: self._apply_angle_preset(a, e, d))
+            btn.clicked.connect(
+                lambda checked=False, a=az, e=el, d=dist: self._apply_angle_preset(a, e, d)
+            )
             preset_row.addWidget(btn, stretch=1)
         layout.addLayout(preset_row)
 
@@ -1491,10 +1585,10 @@ class KritaiDocker(DockWidget):
 
         self._angle_model = QComboBox()
         angle_model_tooltips = {
-            "flux2-klein-4b":      "Distilled 4B model. Fast, no guidance.",
-            "flux2-klein-9b":      "Distilled 9B model. Higher quality, no guidance.",
-            "flux2-klein-9b-kv":   "Distilled 9B model with a KV cache. Same quality as 9B and\n"
-                                   "roughly 2.4x faster once reference images are attached. No guidance.",
+            "flux2-klein-4b": "Distilled 4B model. Fast, no guidance.",
+            "flux2-klein-9b": "Distilled 9B model. Higher quality, no guidance.",
+            "flux2-klein-9b-kv": "Distilled 9B model with a KV cache. Same quality as 9B and\n"
+            "roughly 2.4x faster once reference images are attached. No guidance.",
             "flux2-klein-base-4b": "Base 4B model. Slower, supports guidance.",
             "flux2-klein-base-9b": "Base 9B model. Best quality, supports guidance.",
         }
@@ -1589,9 +1683,9 @@ class KritaiDocker(DockWidget):
 
         self._mask_model = QComboBox()
         model_tooltips = {
-            "birefnet-general":  "Highest edge quality. Larger download, slower first run.",
+            "birefnet-general": "Highest edge quality. Larger download, slower first run.",
             "isnet-general-use": "Balanced quality and speed. Good default.",
-            "u2net":             "Fastest. Solid for clear, simple subjects.",
+            "u2net": "Fastest. Solid for clear, simple subjects.",
         }
         for m in MASK_MODELS:
             self._mask_model.addItem(m)
@@ -1654,8 +1748,8 @@ class KritaiDocker(DockWidget):
             self._angle_guidance_label.setVisible(is_base)
 
     def _build_angle_prompt(self) -> str:
-        az_desc   = _snap_to_nearest_wrap(self._angle_azimuth.value(), AZIMUTH_MAP)
-        el_desc   = _snap_to_nearest(self._angle_elevation.value(), ELEVATION_MAP)
+        az_desc = _snap_to_nearest_wrap(self._angle_azimuth.value(), AZIMUTH_MAP)
+        el_desc = _snap_to_nearest(self._angle_elevation.value(), ELEVATION_MAP)
         dist_desc = _snap_to_nearest(self._angle_distance.value(), DISTANCE_MAP)
         return (
             f"Show the subject from a {az_desc}, {el_desc}, {dist_desc}. "
@@ -1670,7 +1764,7 @@ class KritaiDocker(DockWidget):
     ANNOTATION_TYPE = "kritai_settings"
 
     def _connect_settings_signals(self) -> None:
-        for signal in [
+        for sig in [
             self._gen_prompt.textChanged,
             self._gen_model.currentIndexChanged,
             self._gen_quantize.currentIndexChanged,
@@ -1681,9 +1775,9 @@ class KritaiDocker(DockWidget):
             self._gen_seed.valueChanged,
             self._gen_random_seed.toggled,
         ]:
-            signal.connect(self._save_settings)
+            sig.connect(self._save_settings)
 
-        for signal in [
+        for sig in [
             self._edit_prompt.textChanged,
             self._edit_quantize.currentIndexChanged,
             self._edit_steps.valueChanged,
@@ -1693,9 +1787,9 @@ class KritaiDocker(DockWidget):
             self._edit_seed.valueChanged,
             self._edit_random_seed.toggled,
         ]:
-            signal.connect(self._save_settings)
+            sig.connect(self._save_settings)
 
-        for signal in [
+        for sig in [
             self._angle_model.currentIndexChanged,
             self._angle_azimuth.valueChanged,
             self._angle_elevation.valueChanged,
@@ -1707,13 +1801,13 @@ class KritaiDocker(DockWidget):
             self._angle_seed.valueChanged,
             self._angle_random_seed.toggled,
         ]:
-            signal.connect(self._save_settings)
+            sig.connect(self._save_settings)
 
-        for signal in [
+        for sig in [
             self._mask_model.currentIndexChanged,
             self._mask_alpha_matting.toggled,
         ]:
-            signal.connect(self._save_settings)
+            sig.connect(self._save_settings)
 
         gen_prompt_filter = _FocusOutSignal(self._gen_prompt)
         gen_prompt_filter.focusLost.connect(self._on_setting_changed)
@@ -1721,7 +1815,7 @@ class KritaiDocker(DockWidget):
         edit_prompt_filter = _FocusOutSignal(self._edit_prompt)
         edit_prompt_filter.focusLost.connect(self._on_setting_changed)
 
-        for signal in [
+        for sig in [
             self._gen_model.currentIndexChanged,
             self._gen_quantize.currentIndexChanged,
             self._gen_steps.valueChanged,
@@ -1779,7 +1873,8 @@ class KritaiDocker(DockWidget):
                 "random_seed": self._gen_random_seed.isChecked(),
                 "loras": [
                     {"path": p.text().strip(), "scale": s.value(), "enabled": e.isChecked()}
-                    for e, p, s, _ in self._gen_lora_entries if p.text().strip()
+                    for e, p, s, _ in self._gen_lora_entries
+                    if p.text().strip()
                 ],
             },
             "edit": {
@@ -1799,7 +1894,8 @@ class KritaiDocker(DockWidget):
                 ],
                 "loras": [
                     {"path": p.text().strip(), "scale": s.value(), "enabled": e.isChecked()}
-                    for e, p, s, _ in self._edit_lora_entries if p.text().strip()
+                    for e, p, s, _ in self._edit_lora_entries
+                    if p.text().strip()
                 ],
             },
             "angle": {
@@ -1880,19 +1976,39 @@ class KritaiDocker(DockWidget):
             data = self._migrate_old_settings(data, uid)
 
         all_widgets = [
-            self._gen_prompt, self._gen_model,
-            self._gen_quantize, self._gen_steps, self._gen_guidance,
-            self._gen_strength, self._gen_scale, self._gen_seed, self._gen_random_seed,
+            self._gen_prompt,
+            self._gen_model,
+            self._gen_quantize,
+            self._gen_steps,
+            self._gen_guidance,
+            self._gen_strength,
+            self._gen_scale,
+            self._gen_seed,
+            self._gen_random_seed,
             self._edit_prompt,
-            self._edit_quantize, self._edit_steps, self._edit_guidance,
-            self._edit_strength, self._edit_scale, self._edit_seed, self._edit_random_seed,
+            self._edit_quantize,
+            self._edit_steps,
+            self._edit_guidance,
+            self._edit_strength,
+            self._edit_scale,
+            self._edit_seed,
+            self._edit_random_seed,
             self._angle_model,
-            self._angle_azimuth, self._angle_azimuth_spin,
-            self._angle_elevation, self._angle_elevation_spin,
-            self._angle_distance, self._angle_distance_spin,
-            self._orbit, self._angle_quantize, self._angle_steps, self._angle_guidance,
-            self._angle_scale, self._angle_seed, self._angle_random_seed,
-            self._mask_model, self._mask_alpha_matting,
+            self._angle_azimuth,
+            self._angle_azimuth_spin,
+            self._angle_elevation,
+            self._angle_elevation_spin,
+            self._angle_distance,
+            self._angle_distance_spin,
+            self._orbit,
+            self._angle_quantize,
+            self._angle_steps,
+            self._angle_guidance,
+            self._angle_scale,
+            self._angle_seed,
+            self._angle_random_seed,
+            self._mask_model,
+            self._mask_alpha_matting,
             self._tabs,
         ]
         for w in all_widgets:
@@ -1920,8 +2036,13 @@ class KritaiDocker(DockWidget):
             row.deleteLater()
         self._gen_lora_entries.clear()
         for lora in gen.get("loras", []):
-            self._add_lora_row(self._gen_lora_entries, self._gen_lora_list,
-                               lora.get("path", ""), lora.get("scale", 1.0), lora.get("enabled", True))
+            self._add_lora_row(
+                self._gen_lora_entries,
+                self._gen_lora_list,
+                lora.get("path", ""),
+                lora.get("scale", 1.0),
+                lora.get("enabled", True),
+            )
 
         edit = data.get("edit", {})
         idx = self._edit_model.findText(edit.get("model", "flux2-klein-base-4b"))
@@ -1945,15 +2066,24 @@ class KritaiDocker(DockWidget):
             row.deleteLater()
         self._edit_ref_entries.clear()
         for ref in edit.get("reference_images", []):
-            self._add_ref_row(self._edit_ref_entries, self._edit_ref_list,
-                              ref.get("path", ""), ref.get("enabled", True))
+            self._add_ref_row(
+                self._edit_ref_entries,
+                self._edit_ref_list,
+                ref.get("path", ""),
+                ref.get("enabled", True),
+            )
         for *_, row in list(self._edit_lora_entries):
             self._edit_lora_list.removeWidget(row)
             row.deleteLater()
         self._edit_lora_entries.clear()
         for lora in edit.get("loras", []):
-            self._add_lora_row(self._edit_lora_entries, self._edit_lora_list,
-                               lora.get("path", ""), lora.get("scale", 1.0), lora.get("enabled", True))
+            self._add_lora_row(
+                self._edit_lora_entries,
+                self._edit_lora_list,
+                lora.get("path", ""),
+                lora.get("scale", 1.0),
+                lora.get("enabled", True),
+            )
 
         angle = data.get("angle", {})
         idx = self._angle_model.findText(angle.get("model", "flux2-klein-4b"))
@@ -2051,7 +2181,7 @@ class KritaiDocker(DockWidget):
         doc.exportImage(path, InfoObject())
         doc.setBatchmode(False)
 
-    def _canvas_hash(self) -> Optional[str]:
+    def _canvas_hash(self) -> str | None:
         """Return a hash of a small in-memory thumbnail — no disk I/O."""
         from krita import Krita
 
@@ -2254,8 +2384,7 @@ class KritaiDocker(DockWidget):
 
     def _start_job(self, job: _DocJob, cmd: list[str], verb: str = "Generating") -> None:
         """Run *cmd* for *job*, routing its signals back to that document."""
-        self._append_log(job.uid, "Running: " + " ".join(
-            f'"{t}"' if " " in t else t for t in cmd))
+        self._append_log(job.uid, "Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
         job.start_time = time.monotonic()
         job.progress = 0
         job.status = "Initializing..."
@@ -2266,7 +2395,8 @@ class KritaiDocker(DockWidget):
         job.thread.errored.connect(lambda msg, j=job: self._on_error(j, msg))
         job.thread.logged.connect(lambda text, j=job: self._append_log(j.uid, text))
         job.thread.progress.connect(
-            lambda value, status, j=job: self._on_progress(j, value, status))
+            lambda value, status, j=job: self._on_progress(j, value, status)
+        )
         job.thread.start()
         self._sync_job_ui()
 
@@ -2308,7 +2438,9 @@ class KritaiDocker(DockWidget):
         if abs(scale - 1.0) >= 0.001:
             img = QImage(job.tmp_input)
             if not img.isNull():
-                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(job.tmp_input, "PNG")
+                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(
+                    job.tmp_input, "PNG"
+                )
 
         cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
         cmd = [cli_path, "--prompt", prompt, "--model", model_name]
@@ -2340,17 +2472,25 @@ class KritaiDocker(DockWidget):
         if abs(scale - 1.0) >= 0.001:
             img = QImage(job.tmp_input)
             if not img.isNull():
-                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(job.tmp_input, "PNG")
+                img.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation).save(
+                    job.tmp_input, "PNG"
+                )
 
         cli_path = os.path.join(MFLUX_DIR, "mflux-generate-flux2-edit")
         cmd = [
             cli_path,
-            "--prompt", prompt,
-            "--model", model_name,
-            "--image-paths", job.tmp_input,
-            "--steps", str(self._angle_steps.value()),
-            "--guidance", str(self._angle_guidance.value()) if is_base else "1.0",
-            "--output", job.tmp_output,
+            "--prompt",
+            prompt,
+            "--model",
+            model_name,
+            "--image-paths",
+            job.tmp_input,
+            "--steps",
+            str(self._angle_steps.value()),
+            "--guidance",
+            str(self._angle_guidance.value()) if is_base else "1.0",
+            "--output",
+            job.tmp_output,
         ]
         if (q := self._quantize_value(self._angle_quantize)) is not None:
             cmd += ["--quantize", str(q)]
@@ -2367,9 +2507,7 @@ class KritaiDocker(DockWidget):
         exists = os.path.exists(output_path)
         size = os.path.getsize(output_path) if exists else 0
         self._append_log(
-            job.uid,
-            f"Output path: {output_path}\n"
-            f"File exists: {exists}, size: {size} bytes"
+            job.uid, f"Output path: {output_path}\nFile exists: {exists}, size: {size} bytes"
         )
         self._store_preview(job.uid, output_path)
         self._result_bounds[job.uid] = job.active_bounds
@@ -2389,14 +2527,15 @@ class KritaiDocker(DockWidget):
         """Log against the active document (installs, upscales, ad-hoc notes)."""
         self._append_log(self._current_uid(), text)
 
-    def _append_log(self, uid: Optional[str], text: str) -> None:
+    def _append_log(self, uid: str | None, text: str) -> None:
         if not text:
             return
         job = self._job_for(uid) if uid else None
         if job is not None:
             job.log += text + "\n"
-        downloading = (_match_bar(text) is None
-                       and any(kw in text for kw in ("Downloading", "Fetching", "fetching")))
+        downloading = _match_bar(text) is None and any(
+            kw in text for kw in ("Downloading", "Fetching", "fetching")
+        )
         if downloading and job is not None:
             job.status = "Downloading…"
         if uid is None or uid == self._current_uid():
@@ -2419,6 +2558,7 @@ class KritaiDocker(DockWidget):
 
     def _copy_log(self) -> None:
         from PyQt5.QtWidgets import QApplication
+
         QApplication.clipboard().setText(self._log.toPlainText())
 
     def _clear_log(self) -> None:
@@ -2459,7 +2599,8 @@ class KritaiDocker(DockWidget):
 
     def _clear_preview(self) -> None:
         reply = QMessageBox.question(
-            self, "Clear Preview",
+            self,
+            "Clear Preview",
             "Are you sure you want to clear the preview?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -2540,8 +2681,14 @@ class KritaiDocker(DockWidget):
         softness_row.setToolTip("0.0 = off, 1.0 = maximum softness.")
         upscale_form.addRow("Softness", softness_row)
 
-        default_q = self._quantize_value(self._gen_quantize) if tab == 0 else (
-            self._quantize_value(self._edit_quantize) if tab == 1 else self._quantize_value(self._angle_quantize)
+        default_q = (
+            self._quantize_value(self._gen_quantize)
+            if tab == 0
+            else (
+                self._quantize_value(self._edit_quantize)
+                if tab == 1
+                else self._quantize_value(self._angle_quantize)
+            )
         )
         quantize = self._make_quantize_combo(default=default_q or 4)
         saved_q = saved.get("quantize")
@@ -2602,9 +2749,7 @@ class KritaiDocker(DockWidget):
             dlg_progress.setFormat("Initializing...")
 
             upscale_factor = 1.0 / scale
-            upscaled_path = os.path.join(
-                tempfile.gettempdir(), f"kf_upscaled_{os.getpid()}.png"
-            )
+            upscaled_path = os.path.join(tempfile.gettempdir(), f"kf_upscaled_{os.getpid()}.png")
             # Remove stale file — mflux won't overwrite an existing path.
             if os.path.exists(upscaled_path):
                 os.remove(upscaled_path)
@@ -2612,9 +2757,12 @@ class KritaiDocker(DockWidget):
             cli_path = os.path.join(MFLUX_DIR, "mflux-upscale-seedvr2")
             cmd = [
                 cli_path,
-                "--image-path", job.tmp_output,
-                "--resolution", f"{upscale_factor}x",
-                "--output", upscaled_path,
+                "--image-path",
+                job.tmp_output,
+                "--resolution",
+                f"{upscale_factor}x",
+                "--output",
+                upscaled_path,
             ]
             if softness.value() > 0:
                 cmd += ["--softness", str(softness.value() / 100)]
@@ -2662,10 +2810,12 @@ class KritaiDocker(DockWidget):
             thread.start()
 
         buttons.accepted.connect(on_import)
-        buttons.rejected.connect(lambda: (
-            self._stop_thread(dlg._thread) if hasattr(dlg, "_thread") else None,
-            dlg.reject()
-        ))
+        buttons.rejected.connect(
+            lambda: (
+                self._stop_thread(dlg._thread) if hasattr(dlg, "_thread") else None,
+                dlg.reject(),
+            )
+        )
 
         dlg.exec_()
 
@@ -2678,12 +2828,10 @@ class KritaiDocker(DockWidget):
         stride = img.bytesPerLine()
         if stride == row_bytes:
             return raw
-        return b"".join(
-            raw[y * stride:y * stride + row_bytes] for y in range(img.height())
-        )
+        return b"".join(raw[y * stride : y * stride + row_bytes] for y in range(img.height()))
 
     @classmethod
-    def _layer_pixels(cls, img: QImage, model: str, depth: str) -> Optional[bytes]:
+    def _layer_pixels(cls, img: QImage, model: str, depth: str) -> bytes | None:
         """*img* packed the way a layer in this document's colour space reads it.
 
         setPixelData hands the buffer straight to the layer, so it has to be in
@@ -2717,7 +2865,7 @@ class KritaiDocker(DockWidget):
         uid = self._doc_uid(doc)
         bounds = self._result_bounds.get(uid)
         if bounds:
-            # Dropped back at its original position, native size, on a transparent full-canvas layer.
+            # Dropped back at its original position and size on a transparent full-canvas layer.
             x, y, w, h = bounds
         else:
             x, y, w, h = 0, 0, doc.width(), doc.height()
@@ -2743,8 +2891,14 @@ class KritaiDocker(DockWidget):
 
         self._auto_btn.setChecked(False)
 
-    def _add_lora_row(self, entries_list: list, lora_layout: QVBoxLayout,
-                      path: str = "", scale: float = 1.0, enabled: bool = True) -> None:
+    def _add_lora_row(
+        self,
+        entries_list: list,
+        lora_layout: QVBoxLayout,
+        path: str = "",
+        scale: float = 1.0,
+        enabled: bool = True,
+    ) -> None:
         """Add a LoRA entry row with enable checkbox, path, scale, and remove button."""
         from PyQt5.QtWidgets import QFileDialog
 
@@ -2767,13 +2921,14 @@ class KritaiDocker(DockWidget):
 
         browse_btn = QPushButton("…")
         browse_btn.setFixedWidth(28)
+
         def browse(checked: bool = False, pe: QLineEdit = path_edit) -> None:
             p, _ = QFileDialog.getOpenFileName(
-                self, "Select LoRA file", "",
-                "LoRA files (*.safetensors *.bin);;All files (*)"
+                self, "Select LoRA file", "", "LoRA files (*.safetensors *.bin);;All files (*)"
             )
             if p:
                 pe.setText(p)
+
         browse_btn.clicked.connect(browse)
 
         scale_spin = QDoubleSpinBox()
@@ -2844,8 +2999,9 @@ class KritaiDocker(DockWidget):
         if idx >= 0:
             combo.setCurrentIndex(idx)
 
-    def _add_ref_row(self, entries_list: list, ref_layout: QVBoxLayout,
-                     path: str = "", enabled: bool = True) -> None:
+    def _add_ref_row(
+        self, entries_list: list, ref_layout: QVBoxLayout, path: str = "", enabled: bool = True
+    ) -> None:
         """Add a reference image entry with enable checkbox, thumbnail, and remove button."""
         row = QWidget()
         row_layout = QHBoxLayout(row)
@@ -2891,6 +3047,7 @@ class KritaiDocker(DockWidget):
         self._auto_btn.setChecked(False)
 
         from krita import Krita
+
         self._current_doc = Krita.instance().activeDocument() if canvas is not None else None
         if self._current_doc:
             self._load_settings(self._current_doc)
@@ -2899,7 +3056,8 @@ class KritaiDocker(DockWidget):
         self._sync_job_ui()
         self._update_generate_btn()
 
-def _export_selection_crop(doc: object, path: str) -> Optional[tuple[int, int, int, int]]:
+
+def _export_selection_crop(doc: object, path: str) -> tuple[int, int, int, int] | None:
     """Export the canvas region covered by the current selection to *path*.
 
     Returns ``(x, y, w, h)`` of the selection bounds, or ``None`` if there is
