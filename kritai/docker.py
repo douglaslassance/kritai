@@ -23,9 +23,19 @@ from PyQt5.QtCore import (
     Qt,
     QThread,
     QTimer,
+    QUrl,
     pyqtSignal,
 )
-from PyQt5.QtGui import QBrush, QColor, QFontDatabase, QImage, QPainter, QPen, QPixmap
+from PyQt5.QtGui import (
+    QBrush,
+    QColor,
+    QDesktopServices,
+    QFontDatabase,
+    QImage,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -50,6 +60,17 @@ from PyQt5.QtWidgets import (
     QToolButton,
     QVBoxLayout,
     QWidget,
+)
+
+from .providers import (
+    ADMIN_KEY_HINT,
+    FAL_BILLING_URL,
+    PCT_UNKNOWN,
+    PROVIDER_FAL,
+    PROVIDER_LABELS,
+    PROVIDER_LOCAL,
+    FalProvider,
+    GenerationRequest,
 )
 
 MFLUX_DIR = os.path.expanduser("~/.local/bin")
@@ -609,8 +630,6 @@ _BYTE_RE = re.compile(r"^[\d.]+\s?[kKMGTP]?i?B$")
 _BYTE_RATE_RE = re.compile(r"[\d.]+\s?[kKMGTP]?i?B/s")
 _DOWNLOAD_WORDS = ("download", "reconstruct", "fetching")
 
-PCT_UNKNOWN = -1
-
 
 def _match_bar(line: str) -> re.Match | None:
     return _TQDM_RE.match(line) or _TQDM_NOBAR_RE.match(line)
@@ -982,6 +1001,194 @@ class DependencyDialog(QDialog):
             )
 
 
+class FalKeyTestThread(QThread):
+    """Checks a fal.ai key, then tries to read its credit balance."""
+
+    done = pyqtSignal(bool, str)  # key valid, message
+
+    def __init__(self, provider: FalProvider) -> None:
+        super().__init__()
+        self.provider = provider
+
+    def run(self) -> None:
+        try:
+            self.provider.validate()
+        except Exception as e:
+            self.done.emit(False, str(e))
+            return
+        try:
+            amount, currency = self.provider.balance()
+        except Exception as e:
+            note = ADMIN_KEY_HINT if getattr(e, "http_status", None) in (401, 403) else str(e)
+            self.done.emit(True, f"Key accepted. {note}")
+            return
+        self.done.emit(True, f"Key accepted. Credits: {_format_money(amount, currency)}")
+
+
+def _format_money(amount: float, currency: str) -> str:
+    return f"${amount:,.2f}" if currency == "USD" else f"{amount:,.2f} {currency}"
+
+
+class SettingsDialog(QDialog):
+    """App-wide backend settings: where models run and the fal.ai key."""
+
+    def __init__(self, parent: QWidget, provider_id: str, fal_api_key: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Kritai Settings")
+        self.setMinimumWidth(420)
+        self.provider_id = provider_id
+        self.fal_api_key = fal_api_key
+
+        layout = QVBoxLayout(self)
+
+        box = QGroupBox("Backend")
+        form = QFormLayout(box)
+        form.setContentsMargins(8, 8, 8, 8)
+        form.setSpacing(6)
+
+        self._provider_combo = QComboBox()
+        self._provider_combo.setToolTip(
+            "Where to run the model.\n"
+            "Local (mflux): runs on this Mac, no cost, Apple Silicon only.\n"
+            "Cloud (fal.ai): runs the same models on fal.ai, works anywhere, "
+            "needs an API key and bills per image."
+        )
+        for pid in (PROVIDER_LOCAL, PROVIDER_FAL):
+            self._provider_combo.addItem(PROVIDER_LABELS[pid], pid)
+        idx = self._provider_combo.findData(provider_id)
+        self._provider_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._provider_combo.currentIndexChanged.connect(self._update_key_row)
+        form.addRow("Run on", self._provider_combo)
+
+        self._fal_key_edit = QLineEdit()
+        self._fal_key_edit.setEchoMode(QLineEdit.Password)
+        self._fal_key_edit.setPlaceholderText("fal.ai API key")
+        self._fal_key_edit.setToolTip(
+            "Your fal.ai key. Get one at fal.ai/dashboard/keys.\n"
+            "An admin-scoped key also lets Kritai show your remaining credits."
+        )
+        self._fal_key_edit.setText(fal_api_key)
+        self._fal_key_edit.textChanged.connect(self._on_key_edited)
+        self._fal_key_label = QLabel("fal.ai key")
+        self._key_row = QWidget()
+        key_row = self._key_row
+        key_layout = QHBoxLayout(key_row)
+        key_layout.setContentsMargins(0, 0, 0, 0)
+        key_layout.setSpacing(4)
+        key_layout.addWidget(self._fal_key_edit)
+        self._test_btn = QPushButton("Test")
+        self._test_btn.setToolTip("Check the key against fal.ai and read the credit balance.")
+        self._test_btn.clicked.connect(self._test_key)
+        key_layout.addWidget(self._test_btn)
+        form.addRow(self._fal_key_label, key_row)
+
+        self._key_status = QLabel()
+        self._key_status.setWordWrap(True)
+        self._key_status.setStyleSheet("color: #888; font-size: 11px;")
+        self._key_status.setVisible(False)
+        form.addRow("", self._key_status)
+        layout.addWidget(box)
+
+        self._test_thread: FalKeyTestThread | None = None
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self._update_key_row()
+
+    def _update_key_row(self) -> None:
+        show = self._provider_combo.currentData() == PROVIDER_FAL
+        self._key_row.setVisible(show)
+        self._fal_key_label.setVisible(show)
+        self._key_status.setVisible(show and bool(self._key_status.text()))
+
+    def _on_key_edited(self, _text: str) -> None:
+        self._key_status.clear()
+        self._key_status.setVisible(False)
+
+    def _test_key(self) -> None:
+        key = self._fal_key_edit.text().strip()
+        if not key:
+            self._show_key_status("Enter a key first.", ok=False)
+            return
+        if self._test_thread and self._test_thread.isRunning():
+            return
+        self._test_btn.setEnabled(False)
+        self._show_key_status("Checking...", ok=True)
+        self._test_thread = FalKeyTestThread(FalProvider(key))
+        self._test_thread.done.connect(self._on_key_tested)
+        self._test_thread.start()
+
+    def _on_key_tested(self, ok: bool, message: str) -> None:
+        self._test_btn.setEnabled(True)
+        self._show_key_status(message, ok=ok)
+
+    def _show_key_status(self, text: str, ok: bool) -> None:
+        color = "#888" if ok else "#d9534f"
+        self._key_status.setStyleSheet(f"color: {color}; font-size: 11px;")
+        self._key_status.setText(text)
+        self._key_status.setVisible(True)
+
+    def accept(self) -> None:
+        self.provider_id = self._provider_combo.currentData() or PROVIDER_LOCAL
+        self.fal_api_key = self._fal_key_edit.text().strip()
+        super().accept()
+
+
+class FalThread(QThread):
+    """Runs a GenerationRequest on fal.ai with the same signals as GenerateThread."""
+
+    finished = pyqtSignal(str)  # output path
+    errored = pyqtSignal(str)  # error message
+    logged = pyqtSignal(str)  # line of log output
+    progress = pyqtSignal(int, str)  # 0-100 (or PCT_UNKNOWN), status line
+
+    def __init__(self, provider: FalProvider, request: GenerationRequest) -> None:
+        super().__init__()
+        self.provider = provider
+        self.request = request
+
+    def cancel(self) -> None:
+        self.provider.cancel()
+
+    def kill(self) -> None:
+        # Nothing to escalate to: the poll loop stops at its next check.
+        self.provider.cancel()
+
+    def run(self) -> None:
+        try:
+            self.provider.run(
+                self.request,
+                log=lambda line: self.logged.emit(line),
+                progress=lambda pct, status: self.progress.emit(pct, status),
+            )
+        except Exception as e:
+            self.logged.emit(str(e))
+            self.errored.emit(str(e))
+            return
+        self.finished.emit(self.request.output_path)
+
+
+class FalBalanceThread(QThread):
+    """Fetches the remaining fal.ai credit balance off the UI thread."""
+
+    fetched = pyqtSignal(float, str)  # amount, currency
+    failed = pyqtSignal(str)  # error message
+
+    def __init__(self, provider: FalProvider) -> None:
+        super().__init__()
+        self.provider = provider
+
+    def run(self) -> None:
+        try:
+            amount, currency = self.provider.balance()
+        except Exception as e:
+            self.failed.emit(str(e))
+            return
+        self.fetched.emit(amount, currency)
+
+
 class _FocusOutSignal(QObject):
     """Emits focusLost when the watched widget loses focus."""
 
@@ -1022,7 +1229,7 @@ class _DocJob:
 
     def __init__(self, uid: str) -> None:
         self.uid = uid
-        self.thread: GenerateThread | None = None
+        self.thread: QThread | None = None
         self.tmp_input: str | None = None
         self.tmp_output: str | None = None
         self.start_time: float = 0.0
@@ -1051,6 +1258,14 @@ class KritaiDocker(DockWidget):
         self._jobs: dict[str, _DocJob] = {}
         self._job_counter = 0
         self._result_bounds: dict[str, tuple | None] = {}
+
+        # App-global backend choice, kept in Krita's config since the key is secret.
+        provider = Krita.instance().readSetting("kritai", "provider", PROVIDER_LOCAL)
+        self._provider_id = (
+            provider if provider in (PROVIDER_LOCAL, PROVIDER_FAL) else PROVIDER_LOCAL
+        )
+        self._fal_api_key = Krita.instance().readSetting("kritai", "fal_api_key", "") or ""
+        self._balance_thread: FalBalanceThread | None = None
 
         Krita.instance().notifier().imageSaved.connect(self._on_image_saved)
         Krita.instance().notifier().applicationClosing.connect(self._on_application_closing)
@@ -1168,6 +1383,14 @@ class KritaiDocker(DockWidget):
         self._generate_btn.setToolTip("No active document.")
         self._generate_btn.setDefault(True)
         btn_row.addWidget(self._generate_btn)
+        self._credit_btn = QPushButton()
+        self._credit_btn.setToolTip(
+            "Remaining fal.ai credits. Click to open your fal.ai billing page."
+        )
+        self._credit_btn.setCursor(Qt.PointingHandCursor)
+        self._credit_btn.setVisible(False)
+        self._credit_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(FAL_BILLING_URL)))
+        btn_row.addWidget(self._credit_btn)
         btn_row.addWidget(self._auto_btn)
 
         self._clear_preview_btn = QToolButton()
@@ -1193,6 +1416,13 @@ class KritaiDocker(DockWidget):
         self._log_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
         self._log_btn.toggled.connect(self._on_log_toggled)
         btn_row.addWidget(self._log_btn)
+
+        self._settings_btn = QToolButton()
+        self._settings_btn.setToolTip("Settings")
+        self._settings_btn.setIcon(Krita.instance().icon("configure"))
+        self._settings_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._settings_btn.clicked.connect(self._open_settings)
+        btn_row.addWidget(self._settings_btn)
 
         progress_row = QHBoxLayout()
         progress_row.setContentsMargins(0, 0, 0, 0)
@@ -1253,6 +1483,42 @@ class KritaiDocker(DockWidget):
         outer.addStretch()
 
         self._update_generate_btn()
+        self._refresh_balance()
+
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self, self._provider_id, self._fal_api_key)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        provider_changed = dlg.provider_id != self._provider_id
+        key_changed = dlg.fal_api_key != self._fal_api_key
+        if not provider_changed and not key_changed:
+            return
+        self._provider_id = dlg.provider_id
+        self._fal_api_key = dlg.fal_api_key
+        Krita.instance().writeSetting("kritai", "provider", self._provider_id)
+        Krita.instance().writeSetting("kritai", "fal_api_key", self._fal_api_key)
+        self._credit_btn.setVisible(False)
+        self._refresh_balance()
+
+    def _refresh_balance(self) -> None:
+        """Read the fal.ai balance in the background; the button shows once it lands."""
+        if self._provider_id != PROVIDER_FAL or not self._fal_api_key:
+            return
+        if self._balance_thread and self._balance_thread.isRunning():
+            return
+        self._balance_thread = FalBalanceThread(FalProvider(self._fal_api_key))
+        self._balance_thread.fetched.connect(self._on_balance_fetched)
+        self._balance_thread.failed.connect(self._on_balance_failed)
+        self._balance_thread.start()
+
+    def _on_balance_fetched(self, amount: float, currency: str) -> None:
+        self._credit_btn.setText(f"Credit: {_format_money(amount, currency)}")
+        # A stylesheet would drop the native button height, so widen it instead.
+        self._credit_btn.setMinimumWidth(self._credit_btn.sizeHint().width() + 24)
+        self._credit_btn.setVisible(self._provider_id == PROVIDER_FAL)
+
+    def _on_balance_failed(self, _message: str) -> None:
+        self._credit_btn.setVisible(False)
 
     def _build_generate_tab(self) -> QWidget:
         content = QWidget()
@@ -2254,7 +2520,7 @@ class KritaiDocker(DockWidget):
         self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum())
 
     @staticmethod
-    def _stop_thread(thread: GenerateThread) -> None:
+    def _stop_thread(thread: QThread) -> None:
         """Stop a run and its CLI, escalating if the CLI ignores the first ask."""
         if not thread.isRunning():
             return
@@ -2304,8 +2570,12 @@ class KritaiDocker(DockWidget):
         if not is_mask and not prompt:
             return
 
-        if not self._ensure_dependency(DEP_REMBG if is_mask else DEP_MFLUX):
-            return
+        if is_mask:
+            if not self._ensure_dependency(DEP_REMBG):
+                return
+        elif self._provider_id == PROVIDER_LOCAL:
+            if not self._ensure_dependency(DEP_MFLUX):
+                return
 
         uid = self._doc_uid(doc)
         job = self._job_for(uid)
@@ -2363,6 +2633,16 @@ class KritaiDocker(DockWidget):
             self._export_canvas(doc, job.tmp_input)
         self._sync_preview()
 
+        if self._provider_id == PROVIDER_FAL:
+            if tab == 0:
+                request = self._build_generate_request(prompt, doc, job)
+            elif tab == 1:
+                request = self._build_edit_request(prompt, doc, job)
+            else:
+                request = self._build_angle_request(prompt, doc, job)
+            self._start_fal_job(job, request)
+            return
+
         if tab == 0:
             cmd = self._build_generate_cmd(prompt, doc, job)
         elif tab == 1:
@@ -2383,21 +2663,31 @@ class KritaiDocker(DockWidget):
         self._start_job(job, cmd, verb="Removing background")
 
     def _start_job(self, job: _DocJob, cmd: list[str], verb: str = "Generating") -> None:
-        """Run *cmd* for *job*, routing its signals back to that document."""
+        """Run *cmd* locally for *job*."""
         self._append_log(job.uid, "Running: " + " ".join(f'"{t}"' if " " in t else t for t in cmd))
+        self._launch(job, GenerateThread(cmd, job.tmp_output, verb=verb))
+
+    def _start_fal_job(self, job: _DocJob, request: GenerationRequest) -> None:
+        """Run *request* on fal.ai for *job*, then re-read the credit balance."""
+        self._append_log(job.uid, f"Running on fal.ai: {request.mode} with {request.model_name}")
+        thread = FalThread(FalProvider(self._fal_api_key), request)
+        thread.finished.connect(lambda _path: self._refresh_balance())
+        thread.errored.connect(lambda _msg: self._refresh_balance())
+        self._launch(job, thread)
+
+    def _launch(self, job: _DocJob, thread: QThread) -> None:
+        """Start *thread* for *job*, routing its signals back to that document."""
         job.start_time = time.monotonic()
         job.progress = 0
         job.status = "Initializing..."
         job.elapsed = ""
         job.cancelled = False
-        job.thread = GenerateThread(cmd, job.tmp_output, verb=verb)
-        job.thread.finished.connect(lambda path, j=job: self._on_finished(j, path))
-        job.thread.errored.connect(lambda msg, j=job: self._on_error(j, msg))
-        job.thread.logged.connect(lambda text, j=job: self._append_log(j.uid, text))
-        job.thread.progress.connect(
-            lambda value, status, j=job: self._on_progress(j, value, status)
-        )
-        job.thread.start()
+        job.thread = thread
+        thread.finished.connect(lambda path, j=job: self._on_finished(j, path))
+        thread.errored.connect(lambda msg, j=job: self._on_error(j, msg))
+        thread.logged.connect(lambda text, j=job: self._append_log(j.uid, text))
+        thread.progress.connect(lambda value, status, j=job: self._on_progress(j, value, status))
+        thread.start()
         self._sync_job_ui()
 
     def _build_generate_cmd(self, prompt: str, doc: object, job: _DocJob) -> list[str]:
@@ -2497,6 +2787,78 @@ class KritaiDocker(DockWidget):
         if not self._angle_random_seed.isChecked():
             cmd += ["--seed", str(self._angle_seed.value())]
         return cmd
+
+    def _build_generate_request(self, prompt: str, doc: object, job: _DocJob) -> GenerationRequest:
+        model_name = self._gen_model.currentText()
+        _cli, _flag, supports_strength, supports_guidance, *_ = MODEL_CLI.get(
+            model_name, ("mflux-generate-flux2", model_name, True, True, False)
+        )
+        scale = self._gen_scale.value() / 100
+        return GenerationRequest(
+            mode="generate",
+            model_name=model_name,
+            prompt=prompt,
+            input_image_path=job.tmp_input,
+            output_path=job.tmp_output,
+            width=max(1, int(doc.width() * scale)),
+            height=max(1, int(doc.height() * scale)),
+            resize_output=abs(scale - 1.0) >= 0.001,
+            steps=self._gen_steps.value(),
+            guidance=self._gen_guidance.value() if supports_guidance else None,
+            strength=(self._gen_strength.value() / 100) if supports_strength else None,
+            quantize=self._quantize_value(self._gen_quantize),
+            seed=None if self._gen_random_seed.isChecked() else self._gen_seed.value(),
+            loras=self._get_loras(self._gen_lora_entries),
+        )
+
+    def _build_edit_request(self, prompt: str, doc: object, job: _DocJob) -> GenerationRequest:
+        model_name = self._edit_model.currentText()
+        is_base = "base" in model_name
+        scale = self._edit_scale.value() / 100
+        refs = []
+        for enabled_cb, thumb, _ in self._edit_ref_entries:
+            if not enabled_cb.isChecked():
+                continue
+            ref_path = (thumb.imagePath() or "").strip()
+            if ref_path:
+                refs.append(ref_path)
+        return GenerationRequest(
+            mode="edit",
+            model_name=model_name,
+            prompt=prompt,
+            input_image_path=job.tmp_input,
+            output_path=job.tmp_output,
+            width=max(1, int(doc.width() * scale)),
+            height=max(1, int(doc.height() * scale)),
+            resize_output=abs(scale - 1.0) >= 0.001,
+            steps=self._edit_steps.value(),
+            guidance=self._edit_guidance.value() if is_base else None,
+            quantize=self._quantize_value(self._edit_quantize),
+            seed=None if self._edit_random_seed.isChecked() else self._edit_seed.value(),
+            reference_image_paths=refs,
+            loras=self._get_loras(self._edit_lora_entries),
+        )
+
+    def _build_angle_request(self, prompt: str, doc: object, job: _DocJob) -> GenerationRequest:
+        model_name = self._angle_model.currentText()
+        is_base = "base" in model_name
+        scale = self._angle_scale.value() / 100
+        # The edit model always wants a guidance scale, so distilled models use 1.0.
+        guidance = self._angle_guidance.value() if is_base else 1.0
+        return GenerationRequest(
+            mode="angle",
+            model_name=model_name,
+            prompt=prompt,
+            input_image_path=job.tmp_input,
+            output_path=job.tmp_output,
+            width=max(1, int(doc.width() * scale)),
+            height=max(1, int(doc.height() * scale)),
+            resize_output=abs(scale - 1.0) >= 0.001,
+            steps=self._angle_steps.value(),
+            guidance=guidance,
+            quantize=self._quantize_value(self._angle_quantize),
+            seed=None if self._angle_random_seed.isChecked() else self._angle_seed.value(),
+        )
 
     def _build_edit_prompt(self) -> str:
         return self._edit_prompt.toPlainText().strip()
@@ -2640,8 +3002,10 @@ class KritaiDocker(DockWidget):
         else:
             scale = 1.0  # Mask output matches the canvas; nothing to upscale.
 
+        # The seedvr2 upscaler is an mflux CLI tool, so only the local backend has it.
         can_upscale = (
             scale < 1.0
+            and self._provider_id == PROVIDER_LOCAL
             and job is not None
             and job.tmp_output
             and os.path.exists(job.tmp_output)
@@ -2658,7 +3022,14 @@ class KritaiDocker(DockWidget):
         upscale_group.setCheckable(True)
         upscale_group.setChecked(can_upscale)
         upscale_group.setEnabled(can_upscale)
-        upscale_group.setToolTip("If needed, the image will be upscaled to fit the canvas size.")
+        if scale < 1.0 and self._provider_id != PROVIDER_LOCAL:
+            upscale_group.setToolTip(
+                "Upscaling runs through mflux and is only available on the local backend."
+            )
+        else:
+            upscale_group.setToolTip(
+                "If needed, the image will be upscaled to fit the canvas size."
+            )
         upscale_form = QFormLayout(upscale_group)
 
         softness_row = QWidget()
@@ -2958,21 +3329,27 @@ class KritaiDocker(DockWidget):
         lora_layout.removeWidget(row)
         row.deleteLater()
 
-    @staticmethod
-    def _get_lora_args(entries_list: list) -> list[str]:
+    @classmethod
+    def _get_lora_args(cls, entries_list: list) -> list[str]:
         """Return the --lora-paths and --lora-scales command fragments."""
-        paths = []
-        scales = []
+        loras = cls._get_loras(entries_list)
+        if not loras:
+            return []
+        paths = [p for p, _ in loras]
+        scales = [str(sc) for _, sc in loras]
+        return ["--lora-paths"] + paths + ["--lora-scales"] + scales
+
+    @staticmethod
+    def _get_loras(entries_list: list) -> list:
+        """Return the enabled LoRAs as a list of (path, scale) tuples."""
+        loras = []
         for enabled_cb, path_edit, scale_spin, _ in entries_list:
             if not enabled_cb.isChecked():
                 continue
             p = path_edit.text().strip()
             if p:
-                paths.append(p)
-                scales.append(str(scale_spin.value()))
-        if not paths:
-            return []
-        return ["--lora-paths"] + paths + ["--lora-scales"] + scales
+                loras.append((p, scale_spin.value()))
+        return loras
 
     _QUANTIZE_CHOICES = [None, 3, 4, 5, 6, 8]
 

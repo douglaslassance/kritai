@@ -1,6 +1,6 @@
 # Kritai
 
-A Krita plugin that sends your canvas through a local [mflux](https://github.com/mflux-community/mflux) image-to-image pipeline and displays the result.
+A Krita plugin that sends your canvas through a [mflux](https://github.com/mflux-community/mflux) image-to-image pipeline, locally or on [fal.ai](https://fal.ai), and displays the result.
 
 This project is similar to the [Interstice](https://www.interstice.cloud/) plugin, but has different goals and is less ambitious in scope. Main focuses are:
 
@@ -36,6 +36,14 @@ After running the script:
 3. Enable **Kritai**
 4. Restart Krita
 5. Open the docker via **Settings → Dockers → Kritai**
+
+## Cloud generation with fal.ai
+
+The Generate, Edit and Frame tabs can run on fal.ai instead of your Mac. Open the settings from the gear button next to the log toggle, set **Run on** to **Cloud (fal.ai)**, paste a key from [fal.ai/dashboard/keys](https://fal.ai/dashboard/keys) and press **Test**.
+
+- Any key scope can generate. An **ADMIN** scoped key also lets Kritai show your remaining credit next to the Generate button. Clicking it opens your fal.ai billing page.
+- fal.ai only hosts the distilled klein models, so guidance, LoRAs and quantization settings are ignored there, and base models fall back to the distilled checkpoint of the same size.
+- Upscaling and the Mask tab always run locally.
 
 ## Development
 
