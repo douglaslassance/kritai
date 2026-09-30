@@ -2110,7 +2110,7 @@ class KritaiDocker(DockWidget):
             self._mask_model.currentIndexChanged,
             self._mask_alpha_matting.toggled,
         ]:
-            signal.connect(self._on_setting_changed)
+            sig.connect(self._on_setting_changed)
 
         self._gen_prompt.textChanged.connect(self._update_generate_btn)
         self._edit_prompt.textChanged.connect(self._update_generate_btn)
